@@ -1,0 +1,11 @@
+node_modules
+dist
+.agent-shell
+
+.release-please-manifest.json
+release-please-config.json
+CHANGELOG.md
+
+# Non-source artifacts (planning docs + agent scratch) — excluded from the lint gate
+PLAN.md
+.claude/
