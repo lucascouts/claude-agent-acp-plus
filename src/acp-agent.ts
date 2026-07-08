@@ -4166,6 +4166,7 @@ function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | 
 export const BUILTIN_AGENT_NAMES = new Set([
   "claude",
   "general-purpose",
+  "claude-code-guide",
   "Explore",
   "Plan",
   "statusline-setup",
