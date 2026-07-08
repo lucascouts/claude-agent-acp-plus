@@ -2831,9 +2831,10 @@ export class ClaudeAcpAgent {
       throw new Error(`Unknown config option: ${params.configId}`);
     }
 
-    // Fast mode carries a boolean value (for Clients that opted into boolean
-    // config options) or the "on"/"off" select fallback, so it bypasses the
-    // string-only validation the select-style options below rely on.
+    // Fast mode is always emitted as an "on"/"off" select, but a native
+    // boolean set value is still accepted for compatibility (R2.3), so it
+    // bypasses the string-only validation the select-style options below
+    // rely on.
     if (params.configId === FAST_MODE_CONFIG_ID) {
       await this.applyFastMode(session, resolveFastModeEnabled(params));
       return { configOptions: session.configOptions };
@@ -4815,8 +4816,8 @@ export function createFastModeConfigOption(enabled: boolean): SessionConfigOptio
 }
 
 /** Resolve the requested Fast mode value from a `session/set_config_option`
- *  request. Accepts a native boolean (boolean-capable Clients) or the
- *  "on"/"off" select-fallback strings. */
+ *  request. Accepts the select's "on"/"off" strings or a native boolean,
+ *  kept for backward compatibility (R2.3). */
 export function resolveFastModeEnabled(params: { value: unknown }): boolean {
   const value = params.value;
   if (typeof value === "boolean") {
