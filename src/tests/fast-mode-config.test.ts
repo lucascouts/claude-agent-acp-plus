@@ -3,7 +3,6 @@ import type { ClientCapabilities, SessionNotification } from "@agentclientprotoc
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
-  clientSupportsBooleanConfigOptions,
   createFastModeConfigOption,
   fastModeStateEnabled,
   resolveFastModeEnabled,
@@ -30,61 +29,54 @@ const MODEL_INFOS: ModelInfo[] = [
   { value: "claude-opus-4-8", displayName: "Claude Opus", description: "Most capable" },
 ];
 
-describe("createFastModeConfigOption", () => {
-  it("produces a native boolean toggle when the client opted in", () => {
-    expect(createFastModeConfigOption(true, true)).toEqual({
+describe("createFastModeConfigOption (select-only)", () => {
+  // Boolean-shape assertions inverted to the on/off select: the boolean option
+  // shape is gone for EVERY client (R2.1). `toEqual` keeps the exact-shape
+  // strength the removed boolean-toggle test had.
+  it("emits the exact on/off select for enabled=true", () => {
+    expect(createFastModeConfigOption(true)).toEqual({
       id: FAST_MODE_CONFIG_ID,
       name: "Fast mode",
       description: expect.any(String),
       category: "model_config",
-      type: "boolean",
-      currentValue: true,
+      type: "select",
+      currentValue: FAST_MODE_ON,
+      options: [
+        { value: FAST_MODE_ON, name: "On" },
+        { value: FAST_MODE_OFF, name: "Off" },
+      ],
     });
   });
 
-  it("falls back to an on/off select when the client did not opt in", () => {
-    const option = createFastModeConfigOption(false, false);
-    expect(option).toMatchObject({
+  it("emits the exact on/off select for enabled=false", () => {
+    const option = createFastModeConfigOption(false);
+    expect(option).toEqual({
       id: FAST_MODE_CONFIG_ID,
-      type: "select",
+      name: "Fast mode",
+      description: expect.any(String),
       category: "model_config",
+      type: "select",
       currentValue: FAST_MODE_OFF,
       options: [
         { value: FAST_MODE_ON, name: "On" },
         { value: FAST_MODE_OFF, name: "Off" },
       ],
     });
+    // Never the removed boolean shape.
     expect(option).not.toHaveProperty("currentValue", true);
-  });
-});
-
-describe("clientSupportsBooleanConfigOptions", () => {
-  it("is true only when session.configOptions.boolean is present", () => {
-    expect(
-      clientSupportsBooleanConfigOptions({ session: { configOptions: { boolean: {} } } }),
-    ).toBe(true);
-  });
-
-  it("is false when the capability is omitted or null at any level", () => {
-    expect(clientSupportsBooleanConfigOptions(undefined)).toBe(false);
-    expect(clientSupportsBooleanConfigOptions(null)).toBe(false);
-    expect(clientSupportsBooleanConfigOptions({})).toBe(false);
-    expect(clientSupportsBooleanConfigOptions({ session: { configOptions: {} } })).toBe(false);
-    expect(
-      clientSupportsBooleanConfigOptions({ session: { configOptions: { boolean: null } } }),
-    ).toBe(false);
+    expect(option).not.toHaveProperty("type", "boolean");
   });
 });
 
 describe("resolveFastModeEnabled", () => {
   const base = { sessionId: "s", configId: FAST_MODE_CONFIG_ID };
 
-  it("accepts native boolean values", () => {
-    expect(resolveFastModeEnabled({ ...base, type: "boolean", value: true })).toBe(true);
-    expect(resolveFastModeEnabled({ ...base, type: "boolean", value: false })).toBe(false);
+  it("accepts native boolean values (boolean-era clients, R2.3)", () => {
+    expect(resolveFastModeEnabled({ ...base, value: true })).toBe(true);
+    expect(resolveFastModeEnabled({ ...base, value: false })).toBe(false);
   });
 
-  it("accepts the on/off select fallback", () => {
+  it("accepts the on/off select values (R2.2)", () => {
     expect(resolveFastModeEnabled({ ...base, value: FAST_MODE_ON })).toBe(true);
     expect(resolveFastModeEnabled({ ...base, value: FAST_MODE_OFF })).toBe(false);
   });
@@ -109,7 +101,6 @@ describe("buildConfigOptions Fast mode", () => {
     const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: false,
       enabled: false,
-      useBooleanOption: true,
     });
     expect(options.find((o) => o.id === FAST_MODE_CONFIG_ID)).toBeUndefined();
   });
@@ -119,29 +110,27 @@ describe("buildConfigOptions Fast mode", () => {
     expect(options.find((o) => o.id === FAST_MODE_CONFIG_ID)).toBeUndefined();
   });
 
-  it("surfaces a boolean toggle when supported and the client opted in", () => {
+  it("surfaces the on/off select when supported and enabled (R2.1)", () => {
     const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: true,
       enabled: true,
-      useBooleanOption: true,
     });
-    expect(options).toContainEqual(createFastModeConfigOption(true, true));
+    expect(options).toContainEqual(createFastModeConfigOption(true));
   });
 
-  it("surfaces a select fallback when supported but the client did not opt in", () => {
+  it("surfaces the on/off select when supported and disabled (R2.1)", () => {
     const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: true,
       enabled: false,
-      useBooleanOption: false,
     });
-    expect(options).toContainEqual(createFastModeConfigOption(false, false));
+    expect(options).toContainEqual(createFastModeConfigOption(false));
   });
 });
 
 describe("setSessionConfigOption Fast mode toggle", () => {
   const SESSION_ID = "fast-session";
 
-  function setup(opts: { useBooleanOption: boolean }) {
+  function setup() {
     const sessionUpdates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -153,24 +142,25 @@ describe("setSessionConfigOption Fast mode toggle", () => {
     } as unknown as AcpClient;
 
     const agent = new ClaudeAcpAgent(client);
-    const clientCapabilities: ClientCapabilities = opts.useBooleanOption
-      ? { session: { configOptions: { boolean: {} } } }
-      : {};
-    (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities =
-      clientCapabilities;
+    // A boolean-era client (it advertised boolean config options): the option
+    // is still emitted as a select (R2.1) and the boolean VALUES it sends on
+    // set are still accepted (R2.3).
+    (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
+      session: { configOptions: { boolean: {} } },
+    };
 
     const applyFlagSettings = vi.fn();
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
       query: { applyFlagSettings },
       fastModeEnabled: false,
-      configOptions: [createFastModeConfigOption(false, opts.useBooleanOption)],
+      configOptions: [createFastModeConfigOption(false)],
     };
 
     return { agent, applyFlagSettings, sessionUpdates };
   }
 
-  it("toggles Fast mode on/off through a boolean value", async () => {
-    const { agent, applyFlagSettings } = setup({ useBooleanOption: true });
+  it("accepts boolean values on set and re-renders the select (R2.1, R2.3)", async () => {
+    const { agent, applyFlagSettings } = setup();
 
     const onResponse = await agent.setSessionConfigOption({
       sessionId: SESSION_ID,
@@ -179,7 +169,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
       value: true,
     });
     expect(applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
-    expect(onResponse.configOptions).toContainEqual(createFastModeConfigOption(true, true));
+    expect(onResponse.configOptions).toContainEqual(createFastModeConfigOption(true));
     expect(
       (agent as unknown as { sessions: Record<string, { fastModeEnabled: boolean }> }).sessions[
         SESSION_ID
@@ -193,11 +183,11 @@ describe("setSessionConfigOption Fast mode toggle", () => {
       value: false,
     });
     expect(applyFlagSettings).toHaveBeenLastCalledWith({ fastMode: false });
-    expect(offResponse.configOptions).toContainEqual(createFastModeConfigOption(false, true));
+    expect(offResponse.configOptions).toContainEqual(createFastModeConfigOption(false));
   });
 
-  it("toggles Fast mode through the on/off select fallback", async () => {
-    const { agent, applyFlagSettings } = setup({ useBooleanOption: false });
+  it("toggles Fast mode through the on/off select values (R2.2)", async () => {
+    const { agent, applyFlagSettings } = setup();
 
     const response = await agent.setSessionConfigOption({
       sessionId: SESSION_ID,
@@ -205,11 +195,11 @@ describe("setSessionConfigOption Fast mode toggle", () => {
       value: FAST_MODE_ON,
     });
     expect(applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
-    expect(response.configOptions).toContainEqual(createFastModeConfigOption(true, false));
+    expect(response.configOptions).toContainEqual(createFastModeConfigOption(true));
   });
 
   it("does not change session state when the SDK rejects the flag", async () => {
-    const { agent, applyFlagSettings } = setup({ useBooleanOption: true });
+    const { agent, applyFlagSettings } = setup();
     applyFlagSettings.mockRejectedValueOnce(new Error("nope"));
 
     await expect(
@@ -249,9 +239,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     const session = {
       query: {},
       fastModeEnabled: opts.fastModeEnabled,
-      configOptions: opts.withOption
-        ? [createFastModeConfigOption(opts.fastModeEnabled, true)]
-        : [],
+      configOptions: opts.withOption ? [createFastModeConfigOption(opts.fastModeEnabled)] : [],
     };
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = session;
 
@@ -268,13 +256,13 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     return { sync, session, sessionUpdates };
   }
 
-  it("emits a config_option_update when the SDK reports a new state", async () => {
+  it("emits a config_option_update (as a select) when the SDK reports a new state", async () => {
     const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, "on");
 
     expect(session.fastModeEnabled).toBe(true);
-    expect(session.configOptions).toContainEqual(createFastModeConfigOption(true, true));
+    expect(session.configOptions).toContainEqual(createFastModeConfigOption(true));
     expect(sessionUpdates).toHaveLength(1);
     expect(sessionUpdates[0].update).toMatchObject({
       sessionUpdate: "config_option_update",
@@ -282,7 +270,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     const updated = (
       sessionUpdates[0].update as { configOptions: ReturnType<typeof createFastModeConfigOption>[] }
     ).configOptions;
-    expect(updated).toContainEqual(createFastModeConfigOption(true, true));
+    expect(updated).toContainEqual(createFastModeConfigOption(true));
   });
 
   it("leaves the toggle on and quiet during a rate-limit cooldown", async () => {
@@ -310,7 +298,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     await sync(SESSION_ID, session, "off");
 
     expect(session.fastModeEnabled).toBe(false);
-    expect(session.configOptions).toContainEqual(createFastModeConfigOption(false, true));
+    expect(session.configOptions).toContainEqual(createFastModeConfigOption(false));
     expect(sessionUpdates).toHaveLength(1);
   });
 

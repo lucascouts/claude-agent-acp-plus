@@ -73,7 +73,6 @@ import {
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
-  ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -102,7 +101,15 @@ import {
   handleAskUserQuestionViaPermission,
 } from "./ask-user-question-fallback.js";
 import { agentName } from "./agent-name.js";
+import { filterDeprecatedModels } from "./model-deprecation.js";
 import { SettingsManager } from "./settings.js";
+import {
+  createThinkingConfigOption,
+  effectiveThinkingConfig,
+  resolveThinkingSelection,
+  THINKING_CONFIG_ID,
+} from "./thinking-option.js";
+import { handleRewindCommand, parseRewindInvocation, RewindDeps } from "./rewind-command.js";
 import {
   applyTaskCreate,
   applyTaskUpdate,
@@ -180,6 +187,17 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+
+/** Ceiling on the lazy query recreate's initialization phase (see
+ *  `recreateSessionQuery`). A wedged replacement subprocess could hang
+ *  `initializationResult()` forever (same wedge class as issue #680), and
+ *  every join on `queryRecreateInFlight` — prompt/cancel/the config setters,
+ *  and closeSession/deleteSession/dispose via `teardownSession → cancel()` —
+ *  would inherit that hang. Expiry routes to the recreate's failure path (the
+ *  replacement is closed, the old query stays live, the pending flag is
+ *  retained), bounding every join. Same "obviously stuck" rationale as
+ *  DEFAULT_FORCE_CANCEL_GRACE_MS. */
+const QUERY_RECREATE_INIT_TIMEOUT_MS = 30_000;
 
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
@@ -269,6 +287,37 @@ type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Tri-state Thinking intent (story 006): `true`/`false` once the client has
+   *  set the Thinking config option, `undefined` while untouched — i.e. the
+   *  env-driven `MAX_THINKING_TOKENS` behavior stays in charge (R1.6). Mirrors
+   *  `fastModeEnabled` intent tracking so the selection survives model
+   *  switches (R1.7); collapsed to the SDK's `thinking` option only via
+   *  `effectiveThinkingConfig`. */
+  thinkingEnabled?: boolean;
+  /** Set by the Thinking set-handler when the session's thinking intent
+   *  changes; the next `prompt()` start consumes it to lazily recreate the SDK
+   *  query with the new thinking config (see `recreateSessionQuery`). */
+  pendingQueryRecreate?: boolean;
+  /** The exact SDK `Options` the session's current query was created with.
+   *  `recreateSessionQuery` derives the replacement query's options from these
+   *  plus the live-tracked session state, so creation-only inputs (hooks,
+   *  canUseTool, mcpServers, env, systemPrompt, …) survive the swap without
+   *  re-running `createSession`'s assembly. Always set by `createSession`;
+   *  optional only because tests hand-build Session objects — the recreate
+   *  path fails gracefully when it is absent. Refreshed on every successful
+   *  recreate. */
+  queryOptions?: Options;
+  /** The in-flight lazy query recreate, when one is running. A concurrent
+   *  `prompt()` joins (awaits) it instead of racing a second recreate or
+   *  enqueueing onto the query mid-swap. */
+  queryRecreateInFlight?: Promise<void>;
+  /** Set while a `/rewind` command is running (`handleRewindCommand` in
+   *  flight). A rewind never enqueues a Turn, so it is invisible to the lazy
+   *  query-recreate trigger's idleness check (`turnQueue`/`activeTurn`);
+   *  without this flag a real prompt arriving mid-restore would look idle,
+   *  start a recreate, and close the query underneath `query.rewindFiles()`.
+   *  The trigger additionally requires this flag to be unset. */
+  rewindInFlight?: boolean;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -1069,6 +1118,104 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    // `/rewind` is served fully locally (story 006, R3.2/R3.3): it lists or
+    // restores file checkpoints via the SDK file-rewind API and streams its own
+    // messages. It must be intercepted BEFORE the lazy query-recreate below (a
+    // `/rewind` must not consume this session's pending recreate — that belongs
+    // to the next real turn) and must never enqueue a turn. handleRewindCommand
+    // emits every user-facing update before it resolves, so returning end_turn
+    // here leaves Zed with a complete turn rather than an empty/hung one.
+    const commandText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const rewindInvocation = parseRewindInvocation(commandText);
+    if (rewindInvocation) {
+      // A lazy Thinking recreate may be swapping the session's query right
+      // now; join it first (mirroring cancel()) so the RewindDeps below
+      // capture the live replacement query — not the old one mid-close — and
+      // so the active-turn guard next evaluates the post-recreate queue
+      // state. Safe: `recreateSessionQuery` never rejects.
+      if (session.queryRecreateInFlight) {
+        await session.queryRecreateInFlight;
+      }
+      // Never touch checkpoints while a turn is active or queued (same idleness
+      // predicate as the lazy query-recreate trigger below). The turn FIFO
+      // exists precisely so work lands in submission order; `/rewind` bypassing
+      // it would let `query.rewindFiles()` restore files that the active turn
+      // is editing at that very moment — a mixed workspace state — and would
+      // interleave the rewind's output with the turn's. Refuse, explain, and
+      // leave the checkpoints untouched.
+      if (session.turnQueue?.length || session.activeTurn) {
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text:
+                "A turn is still running in this session, so `/rewind` was not executed " +
+                "(files may be under active edit). Stop the current turn first, then run " +
+                "`/rewind` again.",
+            },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+      const deps: RewindDeps = {
+        sessionId: params.sessionId,
+        client: this.client,
+        query: session.query,
+        // getSessionMessages resolves the SDK's SessionMessage[] (a loosely
+        // typed transcript-row shape that listCheckpoints reads structurally);
+        // reinterpret it as the RewindDeps SDKMessage[] contract.
+        getSessionMessages: async (sessionId) => {
+          const messages = await getSessionMessages(sessionId);
+          return messages as unknown as SDKMessage[];
+        },
+      };
+      // Flag the restore for its whole duration (see Session.rewindInFlight):
+      // a rewind holds no Turn, so without it a concurrent real prompt would
+      // pass the recreate trigger's idleness check below and close the query
+      // under `rewindFiles`.
+      session.rewindInFlight = true;
+      try {
+        await handleRewindCommand(deps, rewindInvocation);
+      } catch (error) {
+        // handleRewindCommand catches its own dep failures; only a rejection
+        // of the client's sessionUpdate channel itself propagates here. Guard
+        // it and report locally instead of surfacing a failed turn.
+        this.logger.error(`Session ${params.sessionId}: /rewind command failed: ${error}`);
+      } finally {
+        session.rewindInFlight = false;
+      }
+      return { stopReason: "end_turn" };
+    }
+
+    // Lazy Thinking application (R1.3): a pending config change is applied by
+    // recreating the SDK query with session resume BEFORE this turn is
+    // enqueued — never mid-turn, so only when no other prompt is in flight. A
+    // concurrent prompt() joins the in-flight recreate rather than racing a
+    // second one (or pushing onto the old query mid-swap). On recreate failure
+    // the flag stays set (retried by the next prompt) and this turn proceeds
+    // on the old query; `recreateSessionQuery` never rejects.
+    if (session.queryRecreateInFlight) {
+      await session.queryRecreateInFlight;
+    } else if (
+      session.pendingQueryRecreate &&
+      !session.turnQueue?.length &&
+      !session.activeTurn &&
+      // An in-flight `/rewind` restore holds no Turn, so the queue checks
+      // above can't see it; recreating now would close the query underneath
+      // `rewindFiles` (see Session.rewindInFlight).
+      !session.rewindInFlight
+    ) {
+      const recreate = this.recreateSessionQuery(params.sessionId, session);
+      session.queryRecreateInFlight = recreate;
+      try {
+        await recreate;
+      } finally {
+        session.queryRecreateInFlight = undefined;
+      }
+    }
+
     const userMessage = promptToClaude(params);
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
@@ -1307,6 +1454,14 @@ export class ClaudeAcpAgent {
     // after each fire so the consumer keeps serving later turns.
     let cancelController = session.cancelController!;
 
+    // The query this consumer serves, bound at start: the lazy Thinking
+    // recreate (`recreateSessionQuery`) can swap `session.query` for a fresh
+    // one while this consumer is parked on the OLD query's next(). A
+    // superseded consumer must abdicate — a fresh consumer owns the new
+    // query — WITHOUT running its end-of-stream/error cleanup, which would
+    // close the session's LIVE (replacement) resources.
+    const myQuery = session.query;
+
     // The in-flight query.next(), kept across abort wake-ups that don't
     // consume a message, so no yielded message is ever dropped — async
     // generators serialize next() calls, so racing a SECOND next() while one
@@ -1318,9 +1473,15 @@ export class ClaudeAcpAgent {
 
     try {
       while (true) {
-        pendingNext ??= session.query
-          .next()
-          .then((result) => ({ kind: "message" as const, result }));
+        // Superseded by a lazy query recreate: a fresh consumer owns
+        // `session.query` now. Abandon the stale in-flight next() (swallowing
+        // its eventual settlement so it can't surface as unhandled) and exit
+        // without touching the session's turns or resources.
+        if (session.query !== myQuery) {
+          void pendingNext?.catch(() => {});
+          return;
+        }
+        pendingNext ??= myQuery.next().then((result) => ({ kind: "message" as const, result }));
         const nextMessage = pendingNext;
         // Fresh abort listener per iteration, removed when next() wins, so a
         // long-lived session doesn't accumulate listeners on one signal.
@@ -1346,11 +1507,15 @@ export class ClaudeAcpAgent {
             session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
           }
           settleActive({ stopReason: "cancelled" });
-          // If the session is being torn down, abandon the in-flight next()
-          // (swallowing any later rejection so it can't surface as unhandled)
-          // and stop; otherwise re-arm and keep consuming — `pendingNext`
-          // stays in flight so its eventual message is processed, not dropped.
-          if (!this.sessions[params.sessionId]) {
+          // If the session is being torn down — or this consumer was
+          // superseded by a lazy query recreate — abandon the in-flight
+          // next() (swallowing any later rejection so it can't surface as
+          // unhandled) and stop; otherwise re-arm and keep consuming —
+          // `pendingNext` stays in flight so its eventual message is
+          // processed, not dropped. The supersession check also keeps a
+          // superseded consumer from clobbering `session.cancelController`
+          // (re-armed below) under the replacement consumer.
+          if (!this.sessions[params.sessionId] || session.query !== myQuery) {
             void nextMessage.catch(() => {});
             return;
           }
@@ -1365,6 +1530,14 @@ export class ClaudeAcpAgent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
+          // A superseded consumer (the lazy query recreate closed the OLD
+          // query out from under it) must NOT run end-of-stream cleanup: the
+          // session's query/input/settings now belong to the replacement and
+          // `closeQueryStream` would tear the LIVE ones down. The recreate
+          // path owns the whole transition; just exit.
+          if (session.query !== myQuery) {
+            return;
+          }
           // The stream ended. Settle the in-flight turns FIRST, then release the
           // stream resources — same order as the error paths (failAllTurns before
           // closeQueryStream). Settling is the user-facing contract; resource
@@ -2405,6 +2578,13 @@ export class ClaudeAcpAgent {
       // `while (true)` only exits via the `done` return above or the catch
       // below, so there is no normal fall-through here.
     } catch (error) {
+      // A superseded consumer's stale next() may reject when the lazy query
+      // recreate closes the old query; the session's live turns and resources
+      // belong to the replacement consumer, so exit without failing turns or
+      // releasing anything.
+      if (session.query !== myQuery) {
+        return;
+      }
       // The query stream itself died (a transport/process error surfaced from
       // query.next()). Turn-level failures (auth, error results) are handled
       // inline via failActive and never reach here. Reject every in-flight turn;
@@ -2444,6 +2624,15 @@ export class ClaudeAcpAgent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
+    }
+    // A lazy Thinking recreate may be swapping the session's query right now;
+    // join it (mirroring prompt()) so `interrupt()` below targets the live
+    // replacement query instead of racing the old one's close — an interrupt
+    // control request killed by that close would reject out of this
+    // fire-and-forget notification. Safe: `recreateSessionQuery` never
+    // rejects.
+    if (session.queryRecreateInFlight) {
+      await session.queryRecreateInFlight;
     }
     // The stream already ended (see closeQueryStream): every in-flight turn was
     // settled when it closed, and there is no live query to interrupt. Calling
@@ -2592,6 +2781,14 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw new Error("Session not found");
     }
+    // A lazy Thinking recreate may be swapping the session's query right now;
+    // join it (mirroring prompt()) so `setPermissionMode` below lands on the
+    // replacement query after cutover instead of an about-to-close one — and
+    // so the mode isn't silently dropped from a query built from the
+    // pre-await state snapshot. Safe: `recreateSessionQuery` never rejects.
+    if (session.queryRecreateInFlight) {
+      await session.queryRecreateInFlight;
+    }
     // The SDK query stream already ended (see closeQueryStream); the session is
     // a husk and `query.setPermissionMode` below would act on a closed query.
     // Fail with the same clear message prompt()/cancel() give for a dead stream.
@@ -2610,6 +2807,16 @@ export class ClaudeAcpAgent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
+    }
+    // A lazy Thinking recreate may be swapping the session's query right now;
+    // join it (mirroring prompt()) so the model/mode/effort/fast SDK calls
+    // below land on the replacement query after cutover instead of an
+    // about-to-close one — and so their state updates aren't silently
+    // dropped from a query built from the pre-await state snapshot. The
+    // THINKING branch only arms the pending flag, so joining first is
+    // harmless for it. Safe: `recreateSessionQuery` never rejects.
+    if (session.queryRecreateInFlight) {
+      await session.queryRecreateInFlight;
     }
     // The SDK query stream already ended (see closeQueryStream); the session is
     // a husk and the `query.setModel`/`setPermissionMode`/`applyFlagSettings`
@@ -2632,6 +2839,24 @@ export class ClaudeAcpAgent {
       return { configOptions: session.configOptions };
     }
 
+    // The Thinking toggle only records the session's intent — the SDK query
+    // swap is deferred to the next prompt() start (lazy recreate, sub-task
+    // 1.3), so there is no SDK call to fail here and the config option is
+    // refreshed and acked immediately, mirroring Fast mode. An unrecognized
+    // value deliberately falls through to the shared invalid-option-value
+    // validation below rather than growing a bespoke error shape.
+    if (params.configId === THINKING_CONFIG_ID) {
+      const enabled = resolveThinkingSelection(params.value);
+      if (enabled !== null) {
+        session.thinkingEnabled = enabled;
+        session.pendingQueryRecreate = true;
+        session.configOptions = session.configOptions.map((o) =>
+          o.id === THINKING_CONFIG_ID ? createThinkingConfigOption(enabled) : o,
+        );
+        return { configOptions: session.configOptions };
+      }
+    }
+
     if (typeof params.value !== "string") {
       throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
@@ -2645,6 +2870,10 @@ export class ClaudeAcpAgent {
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
+    // No deprecation filter here (R4.2, no double work): this list is rebuilt
+    // from the RENDERED option rows, which flow from the already-filtered
+    // picker list (`hideDeprecatedModels` at every session-creation branch) —
+    // so hidden rows are not selectable via aliases either.
     if (!validValue && params.configId === MODEL_CONFIG_ID) {
       const modelInfos: ModelInfo[] = allValues.map((o) => ({
         value: o.value,
@@ -3304,8 +3533,15 @@ export class ClaudeAcpAgent {
           // intent) when a supporting model is selected again.
           supported: newModelInfo?.supportsFastMode ?? false,
           enabled: session.fastModeEnabled,
-          useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
         },
+        // Thinking is model-independent: re-render the retained tri-state
+        // intent so the row survives this rebuild (an option not threaded
+        // through here silently drops from the picker on every model switch,
+        // R1.7). Untouched sessions keep displaying the env-driven state
+        // (R1.6).
+        session.thinkingEnabled ??
+          effectiveThinkingConfig(undefined, process.env.MAX_THINKING_TOKENS, this.logger) !==
+            undefined,
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -3396,14 +3632,12 @@ export class ClaudeAcpAgent {
   }
 
   /** Replace the Fast mode option in `session.configOptions` so it reflects
-   *  `enabled` (and the client's current boolean-capability). A no-op when the
-   *  option isn't present, so callers must confirm the current model surfaces
-   *  it first. */
+   *  `enabled`. A no-op when the option isn't present, so callers must confirm
+   *  the current model surfaces it first. Rebuilds through the single-parameter
+   *  {@link createFastModeConfigOption} — the one source of the option's shape —
+   *  so the shape can't drift from what `buildConfigOptions` first emitted. */
   private refreshFastModeOption(session: Session, enabled: boolean): void {
-    const refreshed = createFastModeConfigOption(
-      enabled,
-      clientSupportsBooleanConfigOptions(this.clientCapabilities),
-    );
+    const refreshed = createFastModeConfigOption(enabled);
     session.configOptions = session.configOptions.map((o) =>
       o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
     );
@@ -3419,6 +3653,297 @@ export class ClaudeAcpAgent {
     await session.query.applyFlagSettings({ fastMode: enabled });
     session.fastModeEnabled = enabled;
     this.refreshFastModeOption(session, enabled);
+  }
+
+  /** Lazily swap a session's SDK query for a fresh one so a Thinking change
+   *  takes effect on the next turn (R1.3): thinking has no live flag-settings
+   *  path in the SDK, so mid-session application goes through query recreation
+   *  with session resume. The replacement resumes the SAME conversation
+   *  (`{ resume: sessionId }` — the adapter's session ids ARE the SDK's, see
+   *  `getOrCreateSession`) and is assembled from the creation-time
+   *  `queryOptions` plus the live-tracked session state (model, permission
+   *  mode, agent, effort, Fast mode), with thinking routed through
+   *  `effectiveThinkingConfig` — the same single code path query creation
+   *  uses (R1.5/R1.6).
+   *
+   *  Deliberately NOT `teardownSession`: that aborts `session.abortController`
+   *  (possibly client-supplied and reused) and evicts the session from the
+   *  map. This path keeps the Session object registered and every controller
+   *  alive; only the query subprocess is replaced.
+   *
+   *  Ordering is what makes the swap safe:
+   *  1. Build + initialize the NEW query first, time-bounded
+   *     (QUERY_RECREATE_INIT_TIMEOUT_MS) so a wedged replacement cannot hang
+   *     the joins on `queryRecreateInFlight`. Any failure leaves the old
+   *     query untouched and usable: the user is told via agent_message_chunk,
+   *     `pendingQueryRecreate` stays set (retried on the next prompt), and the
+   *     caller's turn proceeds on the OLD query. Never rejects.
+   *  2. Re-check, synchronously, session liveness and model/mode drift: if
+   *     the OLD stream died (or the session was evicted) while step 1
+   *     awaited — or a straggler setter moved the model/mode again after the
+   *     delta re-apply — abandon the replacement instead of installing it.
+   *  3. Cut over synchronously — swap `session.query`/`input`, drop the
+   *     consumer handle (so `ensureConsumer` starts a fresh consumer for the
+   *     new query), clear the pending flag — THEN end the old stream. Swapping
+   *     before closing is load-bearing: the superseded consumer only wakes
+   *     after this microtask completes, sees `session.query !== myQuery`, and
+   *     exits via its supersession guards instead of running end-of-stream
+   *     cleanup (which would close the NEW query and dispose live resources).
+   *
+   *  Only called from `prompt()` while the turn queue is idle (concurrent
+   *  RPC entry points join `queryRecreateInFlight`), so there are no in-flight
+   *  turns to migrate and the old query has nothing left to say. */
+  private async recreateSessionQuery(sessionId: string, session: Session): Promise<void> {
+    const newInput = new Pushable<SDKUserMessage>();
+    let newQuery: Query | undefined;
+    try {
+      if (!session.queryOptions) {
+        // Only reachable for hand-built sessions (tests): createSession always
+        // records the options. Routed through the failure path below so the
+        // old query stays usable.
+        throw new Error("session has no recorded query options to rebuild from");
+      }
+
+      // ONE thinking code path for creation and recreation: the session's
+      // tri-state intent beats the env var once set ("off" wins even with
+      // MAX_THINKING_TOKENS present, R1.5); untouched sessions keep the
+      // env-driven behavior (R1.6).
+      const thinking = effectiveThinkingConfig(
+        session.thinkingEnabled,
+        process.env.MAX_THINKING_TOKENS,
+        this.logger,
+      );
+
+      // Snapshot of the live-tracked model/mode the replacement is built
+      // with. A setter that was ALREADY awaiting its control request on the
+      // old query when this recreate started (i.e. past its
+      // `queryRecreateInFlight` join) can land its state update after this
+      // snapshot; the post-init delta re-apply below reconciles the NEW
+      // query, and the synchronous pre-swap check abandons the recreate if
+      // the state moves yet again.
+      let appliedModelId = session.models.currentModelId;
+      let appliedModeId = session.modes.currentModeId;
+
+      const options: Options = {
+        ...session.queryOptions,
+        // Live-tracked state that may have drifted from creation time via
+        // setSessionMode/setModel. `availableModes` ids are the SDK's own
+        // permission modes (see `applySessionMode`'s validation), so the cast
+        // is sound.
+        permissionMode: appliedModeId as PermissionMode,
+        model: appliedModelId,
+        // Resume THIS conversation in the replacement subprocess.
+        resume: sessionId,
+        // Same controller: a client-supplied abort must keep governing the
+        // session across the swap.
+        abortController: session.abortController,
+      };
+      // `sessionId` is mutually exclusive with `resume` (and this is never a
+      // fork); stale creation-time values would make the SDK reject or fork.
+      delete options.sessionId;
+      delete options.forkSession;
+      // Route the fresh resolution in (a stale creation-time `thinking` must
+      // not leak through when the fresh resolution is `undefined`).
+      delete options.thinking;
+      if (thinking !== undefined) {
+        options.thinking = thinking;
+      }
+      if (session.currentAgent === DEFAULT_AGENT_ID) {
+        delete options.agent;
+      } else {
+        options.agent = session.currentAgent;
+      }
+
+      newQuery = query({ prompt: newInput, options });
+      const replacement = newQuery;
+
+      // Everything the replacement needs before it may serve a turn, grouped
+      // into one phase so it can be time-bounded below.
+      const initPhase = (async () => {
+        // Fail fast while the OLD query is still intact: a spawn/resume
+        // problem surfaces here, not after the cutover.
+        await replacement.initializationResult();
+
+        // Flag-layer settings don't survive into a new subprocess; re-apply
+        // the session's current effort and Fast mode before any turn runs on
+        // it (mirrors createSession's initial-effort application). Both are
+        // read post-init, so a setter update that landed during the init
+        // await is already included.
+        const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
+        const effortLevel =
+          typeof effortOpt?.currentValue === "string"
+            ? toSdkEffortLevel(effortOpt.currentValue)
+            : null;
+        if (effortLevel !== null) {
+          await replacement.applyFlagSettings({ effortLevel });
+        }
+        const supportsFastMode =
+          session.modelInfos.find((m) => m.value === session.models.currentModelId)
+            ?.supportsFastMode ?? false;
+        if (session.fastModeEnabled && supportsFastMode) {
+          await replacement.applyFlagSettings({ fastMode: true });
+        }
+
+        // Delta re-apply: a model/mode setter that was already in flight on
+        // the OLD query when this recreate snapshotted the session state may
+        // have landed its update during the awaits above — the client was
+        // acked for a value the replacement wasn't built with. Reconcile via
+        // the new query's live controls (the same calls the setters use), and
+        // keep `options` truthful for the stored `queryOptions` snapshot. (A
+        // setter that instead resolves AFTER the swap applies to the closed
+        // old query and surfaces as a visible rejection to the client — not a
+        // silent desync — which is acceptable.)
+        if (session.models.currentModelId !== appliedModelId) {
+          appliedModelId = session.models.currentModelId;
+          options.model = appliedModelId;
+          await replacement.setModel(appliedModelId);
+        }
+        if (session.modes.currentModeId !== appliedModeId) {
+          appliedModeId = session.modes.currentModeId;
+          options.permissionMode = appliedModeId as PermissionMode;
+          await replacement.setPermissionMode(appliedModeId as PermissionMode);
+        }
+      })();
+
+      // Bound the whole phase (a wedged replacement subprocess can hang
+      // initializationResult() forever — the issue #680 wedge class). Every
+      // join on `queryRecreateInFlight` — prompt/cancel/the setters, and
+      // teardown/dispose via cancel() — would inherit such a hang, so expiry
+      // rejects into the failure path below (replacement closed, old query
+      // untouched, pending flag retained). The timer is cleared on every
+      // path; if the timeout wins, the losing initPhase's later settlement is
+      // absorbed by Promise.race's own subscription, so no rejection can
+      // surface as unhandled.
+      let initTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          initPhase,
+          new Promise<never>((_, reject) => {
+            initTimer = setTimeout(() => {
+              reject(
+                new Error(
+                  `recreate timed out: the replacement query did not finish initializing ` +
+                    `within ${QUERY_RECREATE_INIT_TIMEOUT_MS}ms`,
+                ),
+              );
+            }, QUERY_RECREATE_INIT_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(initTimer);
+      }
+
+      // Liveness re-check: the awaits above are a long window in which the
+      // OLD query's stream can die on its own — its (still-bound, not yet
+      // superseded) consumer then runs closeQueryStream (queryClosed = true,
+      // settings disposed) and, for a dead process, evicts the session.
+      // Installing the new query anyway would brick the session (queryClosed
+      // blocks prompt/cancel/setSessionMode/setSessionConfigOption) or, in
+      // the eviction case, leak the fresh subprocess where no teardown could
+      // ever reach it. Treat it as a failed recreate: release the new
+      // resources and keep the pending flag. Deliberately NO client note
+      // here — "retried on the next prompt" would be false for a dead
+      // session (and meaningless for an evicted one); the authoritative
+      // signal stays the existing SESSION_ENDED flow.
+      if (session.queryClosed || this.sessions[sessionId] !== session) {
+        const reason =
+          this.sessions[sessionId] !== session
+            ? "the session was evicted while the replacement query initialized"
+            : "the session's query stream ended while the replacement query initialized";
+        this.logger.error(`Session ${sessionId}: abandoning Thinking query recreate: ${reason}.`);
+        newInput.end();
+        try {
+          newQuery.close();
+        } catch (closeError) {
+          this.logger.error(
+            `Session ${sessionId}: failed to close abandoned replacement query:`,
+            closeError,
+          );
+        }
+        return;
+      }
+
+      // Reverse-interleaving re-check (synchronous — nothing may await
+      // between here and the swap): if a straggler setter moved the model or
+      // permission mode yet again after the delta re-apply in `initPhase`,
+      // abandon the replacement rather than install it stale. The pending
+      // flag is retained, so the next prompt rebuilds from fresh state.
+      if (
+        session.models.currentModelId !== appliedModelId ||
+        session.modes.currentModeId !== appliedModeId
+      ) {
+        this.logger.error(
+          `Session ${sessionId}: abandoning Thinking query recreate: the session's model ` +
+            `or permission mode changed while the replacement initialized; retrying on ` +
+            `the next prompt.`,
+        );
+        newInput.end();
+        try {
+          newQuery.close();
+        } catch (closeError) {
+          this.logger.error(
+            `Session ${sessionId}: failed to close abandoned replacement query:`,
+            closeError,
+          );
+        }
+        return;
+      }
+
+      // Cutover. Synchronous from here through the old-stream close: the
+      // superseded consumer can only wake in a later microtask, so it never
+      // observes an intermediate state.
+      const oldQuery = session.query;
+      const oldInput = session.input;
+      session.query = newQuery;
+      session.input = newInput;
+      session.queryOptions = options;
+      // The superseded consumer exits via its guards without touching the
+      // session; drop its handle so the caller's ensureConsumer starts a
+      // fresh consumer for the new query.
+      session.consumer = undefined;
+      session.pendingQueryRecreate = false;
+      // End the old stream last; its consumer wakes on the final next() only
+      // after the swap above is complete.
+      oldInput.end();
+      oldQuery.close();
+    } catch (error) {
+      // Keep the OLD query fully usable and the pending flag set (the next
+      // prompt retries); the current turn proceeds with the previous thinking
+      // config. Everything is contained here — never an unhandled rejection.
+      this.logger.error(
+        `Session ${sessionId}: failed to recreate query for Thinking change:`,
+        error,
+      );
+      newInput.end();
+      try {
+        newQuery?.close();
+      } catch (closeError) {
+        this.logger.error(
+          `Session ${sessionId}: failed to close abandoned replacement query:`,
+          closeError,
+        );
+      }
+      try {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text:
+                "Note: the updated Thinking setting could not be applied to this turn " +
+                "(recreating the session's query failed), so it continues with the previous " +
+                "setting. The change will be retried on the next prompt.",
+            },
+          },
+        });
+      } catch (notifyError) {
+        this.logger.error(
+          `Session ${sessionId}: failed to notify the client about the Thinking recreate failure:`,
+          notifyError,
+        );
+      }
+    }
   }
 
   /** Reconcile the session's Fast mode toggle with an SDK-reported
@@ -3622,8 +4147,15 @@ export class ClaudeAcpAgent {
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
-    // Configure thinking behavior from environment variable
-    const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
+    // Configure thinking behavior through the same single code path query
+    // recreation uses (`recreateSessionQuery`). A fresh session's Thinking
+    // intent is untouched (`undefined`), so this resolves to exactly the
+    // legacy env-driven MAX_THINKING_TOKENS behavior (R1.6).
+    const thinking = effectiveThinkingConfig(
+      undefined,
+      process.env.MAX_THINKING_TOKENS,
+      this.logger,
+    );
 
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
@@ -3665,6 +4197,10 @@ export class ClaudeAcpAgent {
       systemPrompt,
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
+      // File checkpointing on by default so `/rewind N` can restore files
+      // (story 006, R3.3). Placed before the user spread so an explicit user
+      // `enableFileCheckpointing` still wins.
+      enableFileCheckpointing: true,
       ...userProvidedOptions,
       // CLAUDE_MODEL_CONFIG env var is a fallback for model
       // configuration (e.g. Bedrock model ID overrides). When the caller
@@ -3842,16 +4378,38 @@ export class ClaudeAcpAgent {
     // consistent with what the user configured.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
     const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-    const allowedModels = Array.isArray(settingsAvailableModels)
-      ? applyAvailableModelsAllowlist(
+    // The CATALOG: allowlist-applied (when configured) but deprecation-
+    // UNfiltered. Preference resolution (`resolveModelPreference`) and
+    // capability lookups read this list, so a persisted preference pointing at
+    // a deprecated model keeps resolving with full capabilities (R4.3 — the
+    // deprecation filter is visibility-only, never a forced migration).
+    const catalogModels = Array.isArray(settingsAvailableModels)
+      ? buildAllowlistedModels(
           initializationResult.models,
           settingsAvailableModels,
           settingsModelOverrides,
         )
       : initializationResult.models;
+    // The PICKER list: same pipeline plus the deprecation visibility filter
+    // (R4.2). With an allowlist this goes through the exported boundary
+    // `applyAvailableModelsAllowlist` (the filter lives inside it — pinned by
+    // model-picker-filter.test.ts); the small allowlist recompute vs.
+    // `catalogModels` is deliberate so the boundary stays the single place
+    // filter and allowlist compose. Without an allowlist the raw SDK list is
+    // the one list-building site that never crosses that boundary, so it
+    // applies the SAME `hideDeprecatedModels` helper directly.
+    const allowedModels = Array.isArray(settingsAvailableModels)
+      ? applyAvailableModelsAllowlist(
+          initializationResult.models,
+          settingsAvailableModels,
+          settingsModelOverrides,
+          this.logger,
+        )
+      : hideDeprecatedModels(initializationResult.models, this.logger);
 
     const models = await getAvailableModels(
       q,
+      catalogModels,
       allowedModels,
       initializationResult.models,
       settingsManager,
@@ -3860,7 +4418,9 @@ export class ClaudeAcpAgent {
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
-    const currentModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
+    // Looked up in the UNfiltered catalog: a session honoring a persisted
+    // deprecated preference must keep that model's real capabilities (R4.3).
+    const currentModelInfo = catalogModels.find((m) => m.value === models.currentModelId);
     const availableModes = buildAvailableModes(currentModelInfo);
 
     // Clamp `permissionMode` if the resolved session does not offer it. The
@@ -3920,17 +4480,27 @@ export class ClaudeAcpAgent {
     const fastMode: FastModeOptionState = {
       supported: currentModelInfo?.supportsFastMode ?? false,
       enabled: fastModeEnabled,
-      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
     };
 
     const configOptions = buildConfigOptions(
       modes,
       models,
-      allowedModels,
+      // The UNfiltered catalog, matching the model-switch rebuild (which
+      // passes `session.modelInfos`): `buildConfigOptions` reads this argument
+      // only for the current model's effort capabilities — picker rows come
+      // from `models.availableModels` — so a deprecated current model keeps
+      // its effort option without leaking hidden rows (R4.3).
+      catalogModels,
       settingsManager.getSettings().effortLevel,
       agents,
       currentAgent,
       fastMode,
+      // A fresh session's Thinking intent is untouched (undefined), so the
+      // display follows the env-driven state. `thinking` already holds
+      // effectiveThinkingConfig(undefined, MAX_THINKING_TOKENS) from above, so
+      // reusing it avoids re-parsing (and re-logging an invalid) env var —
+      // exactly one error log per query creation.
+      thinking !== undefined,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -3949,6 +4519,9 @@ export class ClaudeAcpAgent {
       input: input,
       cancelled: false,
       cwd: params.cwd,
+      // Recorded so `recreateSessionQuery` (lazy Thinking application, R1.3)
+      // can rebuild an equivalent query without re-running this assembly.
+      queryOptions: options,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
       accumulatedUsage: {
@@ -3959,7 +4532,11 @@ export class ClaudeAcpAgent {
       },
       modes,
       models,
-      modelInfos: allowedModels,
+      // The UNfiltered catalog, NOT the picker list: `modelInfos` is never
+      // rendered (picker rows come from `models.availableModels`) — it feeds
+      // capability lookups and `resolveModelPreference` (refusal fallback),
+      // which must keep seeing deprecated rows (R4.3, visibility-only filter).
+      modelInfos: catalogModels,
       configOptions,
       agents,
       currentAgent,
@@ -4202,8 +4779,8 @@ export const EFFORT_CONFIG_ID = "effort";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
 
-/** Select-fallback values used when the client has not opted into boolean
- *  config options (see {@link createFastModeConfigOption}). */
+/** Select values for the Fast mode on/off option
+ *  (see {@link createFastModeConfigOption}). */
 export const FAST_MODE_ON = "on";
 export const FAST_MODE_OFF = "off";
 const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
@@ -4216,37 +4793,18 @@ export function fastModeStateEnabled(state: FastModeState): boolean {
   return state !== "off";
 }
 
-/** Whether the Client advertised support for boolean session config options
- *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
- *  config options to Clients that opt in; otherwise we fall back to a `select`.
- *  See https://agentclientprotocol.com/rfds/boolean-config-option. */
-export function clientSupportsBooleanConfigOptions(
-  clientCapabilities?: ClientCapabilities | null,
-): boolean {
-  return clientCapabilities?.session?.configOptions?.boolean != null;
-}
-
-/** Build the Fast mode config option. When the Client supports boolean config
- *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
- *  a two-value `select` ("on"/"off") so older Clients still get a usable
- *  control. */
-export function createFastModeConfigOption(
-  enabled: boolean,
-  useBooleanOption: boolean,
-): SessionConfigOption {
-  const base = {
+/** Build the Fast mode config option as a two-value on/off `select`. Emitted
+ *  for EVERY Client — the boolean option shape is gone (story 006, R2.1). Only
+ *  the emitted SHAPE is fixed to a select; boolean VALUES are still honored on
+ *  set (see {@link resolveFastModeEnabled}). This factory is the single source
+ *  of the option's shape, re-rendered by `refreshFastModeOption` /
+ *  `syncFastModeState` so the shape can never desync. */
+export function createFastModeConfigOption(enabled: boolean): SessionConfigOption {
+  return {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
     description: FAST_MODE_DESCRIPTION,
     category: "model_config",
-  } as const;
-
-  if (useBooleanOption) {
-    return { ...base, type: "boolean", currentValue: enabled };
-  }
-
-  return {
-    ...base,
     type: "select",
     currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
     options: [
@@ -4259,7 +4817,7 @@ export function createFastModeConfigOption(
 /** Resolve the requested Fast mode value from a `session/set_config_option`
  *  request. Accepts a native boolean (boolean-capable Clients) or the
  *  "on"/"off" select-fallback strings. */
-export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): boolean {
+export function resolveFastModeEnabled(params: { value: unknown }): boolean {
   const value = params.value;
   if (typeof value === "boolean") {
     return value;
@@ -4278,8 +4836,6 @@ export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): b
 export type FastModeOptionState = {
   supported: boolean;
   enabled: boolean;
-  /** Whether the Client opted into boolean config options. */
-  useBooleanOption: boolean;
 };
 
 export function buildConfigOptions(
@@ -4290,6 +4846,12 @@ export function buildConfigOptions(
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
   fastMode?: FastModeOptionState,
+  /** Display state for the Thinking toggle: the session's tri-state intent
+   *  already collapsed to a boolean by the caller
+   *  (`intent ?? (effectiveThinkingConfig(undefined, env, logger) !== undefined)`).
+   *  Both session call sites always supply it (R1.1); `undefined` (direct
+   *  callers/tests) omits the row. */
+  thinkingEnabled?: boolean,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -4354,10 +4916,17 @@ export function buildConfigOptions(
   }
 
   // Surface the Fast mode toggle only when the current model supports it. The
-  // option renders as a native boolean toggle for Clients that opted in, and a
-  // two-value select otherwise.
+  // option is always emitted as a two-value on/off select for every Client
+  // (R2.1); boolean values remain accepted on set for boolean-era clients.
   if (fastMode?.supported) {
-    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.useBooleanOption));
+    options.push(createFastModeConfigOption(fastMode.enabled));
+  }
+
+  // Surface the Thinking toggle whenever the caller supplies its display
+  // state. Unlike Fast mode it is model-independent — no `supported` gate —
+  // and select-only ("on"/"off"), so every session shows it (R1.1).
+  if (thinkingEnabled !== undefined) {
+    options.push(createThinkingConfigOption(thinkingEnabled));
   }
 
   // Only surface the Agent picker when there's a real choice — i.e. the user
@@ -4516,7 +5085,8 @@ function resolveSettingsModel(
 }
 
 /**
- * Restrict the SDK's model list to the user's `availableModels` allowlist
+ * Deprecation-UNfiltered core of {@link applyAvailableModelsAllowlist}:
+ * restrict the SDK's model list to the user's `availableModels` allowlist
  * (already merged-and-deduped across settings sources by `SettingsManager`).
  * The user's exact entries become the model IDs surfaced via configOptions
  * and passed to `setModel`, which prevents Claude Code from silently
@@ -4526,12 +5096,16 @@ function resolveSettingsModel(
  * Display info and capability flags are copied from the closest SDK match so
  * the UI still renders sensible names and effort levels.
  *
+ * Kept separate from the exported boundary so session creation can obtain the
+ * allowlist-applied-but-unfiltered CATALOG that preference resolution and
+ * capability lookups read (R4.3 — the deprecation filter is visibility-only).
+ *
  * Semantics from https://code.claude.com/docs/en/model-config#restrict-model-selection:
  * - `undefined` is handled by the caller (no allowlist applied).
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
  */
-export function applyAvailableModelsAllowlist(
+function buildAllowlistedModels(
   sdkModels: ModelInfo[],
   allowlist: string[],
   settingsModelOverrides?: Record<string, string>,
@@ -4591,9 +5165,72 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
+/**
+ * Visibility filter for PICKER-bound model lists (R4.2): drop rows
+ * {@link filterDeprecatedModels} flags as deprecated/legacy. Every
+ * list-building site applies this same helper — via
+ * {@link applyAvailableModelsAllowlist} when an allowlist is configured, or
+ * directly on the raw SDK list otherwise — so the picker never renders a
+ * deprecated row regardless of configuration.
+ *
+ * This is visibility-only: preference resolution and capability lookups keep
+ * reading the UNfiltered catalog (R4.3), so a persisted preference pointing at
+ * a deprecated model is still honored.
+ *
+ * Edge: if the filter would hide EVERY row, fall back to the unfiltered input
+ * so config-option building never receives an empty model list, and log it.
+ * The logger is optional because this is also reached from the free exported
+ * boundary (tests, library callers) where no agent logger exists.
+ */
+function hideDeprecatedModels(models: ModelInfo[], logger?: Logger): ModelInfo[] {
+  const visible = filterDeprecatedModels(models);
+  if (visible.length === 0 && models.length > 0) {
+    logger?.error(
+      "Deprecation filter would hide every available model; showing the unfiltered list instead.",
+    );
+    return models;
+  }
+  return visible;
+}
+
+/**
+ * The exported picker-list boundary: {@link buildAllowlistedModels} (the
+ * user's `availableModels` allowlist semantics — see its doc) composed with
+ * {@link hideDeprecatedModels} (the deprecation visibility filter, R4.2).
+ *
+ * The filter runs on the allowlist RESULT, not on `sdkModels`: allowlisted
+ * entries copy `displayName`/`description` from their closest SDK match, so a
+ * deprecated row is hidden even when the allowlist names it explicitly.
+ * Entries with no SDK match copy the entry text itself into `displayName`
+ * ({@link buildAllowlistedModels}), so the heuristic DOES read user-authored
+ * text: a custom entry containing "legacy"/"deprecated" is hidden from the
+ * picker (rare, accepted false positive — the model stays reachable via
+ * `settings.model` / `ANTHROPIC_MODEL`, which resolve over the unfiltered
+ * catalog).
+ */
+export function applyAvailableModelsAllowlist(
+  sdkModels: ModelInfo[],
+  allowlist: string[],
+  settingsModelOverrides?: Record<string, string>,
+  logger?: Logger,
+): ModelInfo[] {
+  return hideDeprecatedModels(
+    buildAllowlistedModels(sdkModels, allowlist, settingsModelOverrides),
+    logger,
+  );
+}
+
 async function getAvailableModels(
   query: Query,
+  /** Deprecation-UNfiltered catalog (allowlist-applied when configured):
+   *  preference resolution and the default pick read this list so a persisted
+   *  deprecated preference still resolves (R4.3). */
   models: ModelInfo[],
+  /** Deprecation-filtered picker list: becomes the rendered `availableModels`
+   *  rows (R4.2). The resolved `currentModelId` may legitimately be absent
+   *  from these rows (deprecated persisted preference) — the picker then
+   *  shows no selection, mirroring the refusal-fallback bookkeeping. */
+  pickerModels: ModelInfo[],
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
@@ -4640,7 +5277,7 @@ async function getAvailableModels(
   }
 
   return {
-    availableModels: models.map((model) => ({
+    availableModels: pickerModels.map((model) => ({
       modelId: model.value,
       name: model.displayName,
       description: model.description,
@@ -4661,7 +5298,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "todos",
   ];
 
-  return commands
+  const advertised: AvailableCommand[] = commands
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -4681,6 +5318,19 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  // `/rewind` is handled fully locally by the adapter (story 006, R3.1), so it
+  // is absent from the SDK command list; advertise it here with an input hint.
+  // Deduped by name so a same-named SDK command (should one ever appear) wins.
+  if (!advertised.some((command) => command.name === "rewind")) {
+    advertised.push({
+      name: "rewind",
+      description: "List file checkpoints, or restore files to one with `/rewind <n>`.",
+      input: { hint: "checkpoint number (omit to list)" },
+    });
+  }
+
+  return advertised;
 }
 
 function formatUriAsLink(uri: string): string {
@@ -5393,25 +6043,6 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
     logger.error("Failed to fetch context usage from SDK:", error);
     return null;
   }
-}
-
-/** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
- *  option. The `maxThinkingTokens` option it used to feed is deprecated and
- *  reduced to on/off on current models, so map the value to explicit thinking
- *  config instead: unset → `undefined` (SDK default, adaptive on models that
- *  support it); `0` → disabled; a positive integer → a fixed token budget.
- *  Anything else is ignored with a warning. */
-function resolveThinkingConfig(
-  raw: string | undefined,
-  logger: Logger,
-): ThinkingConfig | undefined {
-  if (raw === undefined) return undefined;
-  const parsed = Number.parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 0) {
-    logger.error(`Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${raw}'.`);
-    return undefined;
-  }
-  return parsed === 0 ? { type: "disabled" } : { type: "enabled", budgetTokens: parsed };
 }
 
 function parseModelConfig(

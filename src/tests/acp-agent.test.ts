@@ -2321,7 +2321,7 @@ describe("stop reason propagation", () => {
       query: wrapQuery(messageGenerator()),
       input,
       fastModeEnabled: false,
-      configOptions: [createFastModeConfigOption(false, true)],
+      configOptions: [createFastModeConfigOption(false)],
     });
 
     await agent.prompt({
@@ -2336,9 +2336,7 @@ describe("stop reason propagation", () => {
       (n: any) => n.update?.sessionUpdate === "config_option_update",
     );
     expect(configUpdates).toHaveLength(1);
-    expect(configUpdates[0].update.configOptions).toContainEqual(
-      createFastModeConfigOption(true, true),
-    );
+    expect(configUpdates[0].update.configOptions).toContainEqual(createFastModeConfigOption(true));
   });
 
   it("does not fold a task-notification result's tokens into an already-active turn's usage", async () => {
