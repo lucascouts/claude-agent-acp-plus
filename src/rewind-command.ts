@@ -56,7 +56,7 @@ export function parseRewindInvocation(promptText: string): RewindInvocation | nu
   if (/[\r\n]/.test(promptText.trim())) {
     return null;
   }
-  const match = /^\/rewind(?:\s+(.*))?$/.exec(promptText.trim());
+  const match = promptText.trim().match(/^\/rewind(?:\s+(\S.*))?$/);
   if (!match) {
     return null;
   }
