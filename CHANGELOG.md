@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.3.0...v0.4.0) (2026-07-19)
+
+
+### Features
+
+* port upstream v0.59.0 (configurable LLM providers, subagent fixes) ([#14](https://github.com/lucascouts/claude-agent-acp-plus/issues/14)) ([dd7dc4d](https://github.com/lucascouts/claude-agent-acp-plus/commit/dd7dc4d6a9c0aa54db4b438d46c378770e8e28e5))
+
+
+### Security
+
+* remove polynomial ReDoS (CWE-1333) in subagent trailer stripping ([#14](https://github.com/lucascouts/claude-agent-acp-plus/issues/14)) ([dd7dc4d](https://github.com/lucascouts/claude-agent-acp-plus/commit/dd7dc4d6a9c0aa54db4b438d46c378770e8e28e5))
+
+  The `<usage>` / `agentId:` trailer patterns inherited from upstream v0.59.0
+  were tail-anchored but not start-anchored, so the engine retried from every
+  position — O(n²) on text repeating an opening token, which a subagent can
+  echo verbatim into the `tool_result` its report is parsed from. Rewritten
+  with index matching (constant-time on the same input), semantics verified
+  identical against the original on 200k randomized cases.
+
 ## [0.3.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.2.0...v0.3.0) (2026-07-11)
 
 
