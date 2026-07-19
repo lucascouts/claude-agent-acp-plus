@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.3.0...v0.4.0) (2026-07-19)
+
+
+### Features
+
+* port upstream v0.59.0 (configurable LLM providers, subagent fixes) ([#14](https://github.com/lucascouts/claude-agent-acp-plus/issues/14)) ([dd7dc4d](https://github.com/lucascouts/claude-agent-acp-plus/commit/dd7dc4d6a9c0aa54db4b438d46c378770e8e28e5))
+
 ## [0.3.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.2.0...v0.3.0) (2026-07-11)
 
 
