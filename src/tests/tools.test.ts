@@ -2275,6 +2275,40 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     ]);
   });
 
+  it("strips trailers by index, matching the tail-anchored semantics exactly", () => {
+    // Guards the ReDoS rewrite (the tail-anchored regexes were quadratic on
+    // text repeating an opening token, which a subagent can echo verbatim).
+    // These are the edge cases where a naive index rewrite diverges:
+    //  - `<usage>` strips from the FIRST opener (the old lazy body stretched
+    //    to the final `</usage>` to satisfy `$`), not the last;
+    //  - the `agentId:` trailer had an OPTIONAL leading newline, so it also
+    //    matches mid-line;
+    //  - a `)` inside the parenthesised body rules the trailer out.
+    const cases: Array<[string, string]> = [
+      ["Report.\n<usage>A</usage> mid <usage>B</usage>", "Report."],
+      // only the optional newline is absorbed — a preceding space stays
+      ["mid-line agentId: a1 (x)", "mid-line "],
+      ["Report.\nagentId: abc (paren ) inside)", "Report.\nagentId: abc (paren ) inside)"],
+      ["a\nagentId: a1 (x)agentId: a2 (y)", "a\nagentId: a1 (x)"],
+      ["Report.\n<usage>a</usage>\n\n\n", "Report."],
+    ];
+
+    for (const [input, expected] of cases) {
+      const update = toolUpdateFromToolResult(
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_agent",
+          content: [{ type: "text", text: input }],
+        } as ToolResultBlockParam,
+        agentToolUse,
+        false,
+      );
+      expect(update.content).toEqual([
+        { type: "content", content: { type: "text", text: expected } },
+      ]);
+    }
+  });
+
   it("falls back (trailer-stripped) when tool_use_result is the async_launched variant", () => {
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
       status: "async_launched",

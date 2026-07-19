@@ -515,10 +515,58 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
  * matching rather than mangle the report.
  */
 function stripAgentTrailer(text: string): string {
-  return text
-    .replace(/\n?<usage>[\s\S]*?<\/usage>\s*$/, "")
-    .replace(/\n?agentId: [\w-]+ \([^)]*\)\s*$/, "");
+  // Matched by index rather than by tail-anchored regexes: an unanchored
+  // `…\s*$` pattern retries from every start position, so it costs O(n²) on
+  // text that repeats the trailer's opening token — and a subagent can echo
+  // exactly such text verbatim into its report. The index form is linear and
+  // keeps the same tail-anchored, independent semantics.
+  let out = text;
+
+  const beforeUsage = out.trimEnd();
+  if (beforeUsage.endsWith("</usage>")) {
+    // FIRST `<usage>`, not the last: the original pattern was unanchored, so
+    // it matched from the leftmost opener and its lazy body then stretched to
+    // the final `</usage>` to satisfy `$` — i.e. everything from the first
+    // opener onward is part of the stripped trailer.
+    const start = beforeUsage.indexOf("<usage>");
+    if (start !== -1) {
+      out = beforeUsage.slice(0, start);
+      if (out.endsWith("\n")) out = out.slice(0, -1);
+    }
+  }
+
+  // `agentId: <id> (…)`. The original `\n?` was optional, so the trailer did
+  // NOT have to start a line. Its match is nonetheless unique: `[^)]*` forbids
+  // `)` in the body, so the closing paren can only be the final character and
+  // the opener can only be the LAST `(` — which pins the whole match without
+  // scanning from every position.
+  const beforeAgentId = out.trimEnd();
+  if (beforeAgentId.endsWith(")")) {
+    const open = beforeAgentId.lastIndexOf("(");
+    const body = open === -1 ? null : beforeAgentId.slice(open + 1, beforeAgentId.length - 1);
+    // A `)` inside the body rules the trailer out (no earlier `(` can help:
+    // that stray `)` would still fall inside its body).
+    if (body !== null && !body.includes(")")) {
+      const head = beforeAgentId.slice(0, open);
+      if (head.endsWith(" ")) {
+        const beforeSpace = head.slice(0, -1);
+        const idStart = beforeSpace.lastIndexOf(" ") + 1;
+        const id = beforeSpace.slice(idStart);
+        if (AGENT_ID.test(id) && beforeSpace.slice(0, idStart).endsWith("agentId: ")) {
+          let start = idStart - "agentId: ".length;
+          if (start > 0 && beforeAgentId[start - 1] === "\n") start -= 1;
+          out = beforeAgentId.slice(0, start);
+        }
+      }
+    }
+  }
+
+  return out;
 }
+
+/** The `<id>` of an `agentId:` trailer — tested only against an already
+ *  isolated, space-delimited token, never scanned across the whole report. */
+const AGENT_ID = /^[\w-]+$/;
 
 /** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
  *  string or block array), leaving non-text blocks untouched. */
