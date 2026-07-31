@@ -197,12 +197,31 @@ export function formatCheckpointList(cps: Checkpoint[]): string {
 
 /**
  * Confirm a completed rewind, naming the checkpoint that was restored by its
- * index and excerpt (R3.4).
+ * index and excerpt (R3.4). When the SDK reports files it refused to touch for
+ * link safety, the confirmation is qualified with their count (R1.1) in the
+ * grammatical number that count calls for (R1.4), so the sentence cannot claim
+ * a clean success the rewind did not have.
+ *
+ * The unqualified sentence is unchanged character for character: an absent,
+ * zero, negative or non-numeric count returns exactly what this function
+ * returned before the qualifier existed (R1.2). The SDK exposes a COUNT only,
+ * never the refused paths, so the message deliberately names no files.
  *
  * @param cp The checkpoint whose files were restored.
+ * @param skippedLinks How many tracked files the SDK left unchanged for link
+ *   safety (`RewindFilesResult.skippedLinks`); omit or pass 0 when none were.
  */
-export function formatRewindResult(cp: Checkpoint): string {
-  return `Rewound files to checkpoint ${cp.index}: "${cp.excerpt}".`;
+export function formatRewindResult(cp: Checkpoint, skippedLinks?: number): string {
+  const confirmation = `Rewound files to checkpoint ${cp.index}: "${cp.excerpt}".`;
+  // Type AND value are checked: the SDK field is optional, so `undefined` is
+  // the normal path, and testing `> 0` on a number also rejects NaN — nothing
+  // but a real positive count may reach the qualifier.
+  if (typeof skippedLinks === "number" && skippedLinks > 0) {
+    // Subject + verb agree with the count (R1.4): "1 file was", "2 files were".
+    const refusal = skippedLinks === 1 ? "1 file was" : `${skippedLinks} files were`;
+    return `${confirmation} ${refusal} left unchanged for link safety.`;
+  }
+  return confirmation;
 }
 
 /**
@@ -264,7 +283,9 @@ async function emit(deps: RewindDeps, text: string): Promise<void> {
  * nothing-to-rewind notice). `restore` fetches + rebuilds the list, validates
  * the requested index, and on a hit calls `query.rewindFiles` with the tracked
  * uuid inside a try/catch — a rejection (or a `canRewind: false` result) is
- * reported via {@link formatRewindError} and never claims success. An `invalid`
+ * reported via {@link formatRewindError} and never claims success. A success
+ * that refused files for link safety carries that count into the confirmation
+ * (R1.1), so a partial rewind is not reported as a whole one. An `invalid`
  * invocation, an out-of-range index, or a failed transcript read each emit an
  * error and leave files untouched (`rewindFiles` is never called); the
  * `invalid` path still reads the transcript so its usage message can name the
@@ -325,8 +346,12 @@ export async function handleRewindCommand(
     return;
   }
 
+  // Declared out here (same shape as `checkpoints` above) so the confirmation
+  // below can read `skippedLinks` off it; the assignment and every early
+  // `return` stay inside the try/catch exactly where they were.
+  let result: RewindFilesResult;
   try {
-    const result = await deps.query.rewindFiles(checkpoint.uuid);
+    result = await deps.query.rewindFiles(checkpoint.uuid);
     if (result.canRewind === false) {
       await emit(
         deps,
@@ -342,5 +367,5 @@ export async function handleRewindCommand(
     return;
   }
 
-  await emit(deps, formatRewindResult(checkpoint));
+  await emit(deps, formatRewindResult(checkpoint, result.skippedLinks));
 }
