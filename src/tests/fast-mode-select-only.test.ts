@@ -8,11 +8,17 @@ import {
 } from "../acp-agent.js";
 
 /**
- * Contract fixed by story 006 (R2.1, R2.3): the Fast mode option is emitted as
- * an on/off select for every client — the boolean option SHAPE is removed
- * entirely (single-parameter factory, no `useBooleanOption`) — while boolean
- * VALUES remain accepted by the set-handler so clients that previously used
- * the boolean shape keep working without migrating persisted state.
+ * Contract fixed by story 006 (R2.1, R2.3) and retained through the v0.64.0
+ * sync (story 008, R3.4): the Fast mode option is emitted as an on/off select
+ * for every client — the boolean option SHAPE is removed entirely, with no
+ * `useBooleanOption` branch — while boolean VALUES remain accepted by the
+ * set-handler so clients that previously used the boolean shape keep working
+ * without migrating persisted state.
+ *
+ * The contract is stated BEHAVIOURALLY, not as a parameter count. The factory
+ * legitimately takes a second parameter again (upstream's `disabledReason`,
+ * kept by this sync), so arity says nothing about the removed branch; what
+ * matters is that no argument combination can produce the boolean shape.
  */
 
 // Legacy-style caller: lets the suite prove that no argument combination can
@@ -21,11 +27,34 @@ import {
 const legacyCall = createFastModeConfigOption as unknown as (...args: unknown[]) => {
   type?: string;
   currentValue?: unknown;
+  options?: unknown;
 };
 
 describe("createFastModeConfigOption (select-only)", () => {
-  it("declares exactly one parameter — the boolean-shape branch is gone (R2.1)", () => {
-    expect(createFastModeConfigOption.length).toBe(1);
+  it("yields the select for every argument combination — no boolean branch survives (R2.1)", () => {
+    // The exhaustive form of the contract: whatever a caller passes — including
+    // the removed `useBooleanOption` position, now occupied by `disabledReason`
+    // — the shape is a select carrying both on/off options.
+    const combinations: unknown[][] = [
+      [true],
+      [false],
+      [true, true],
+      [false, true],
+      [true, "free"],
+      [false, "free"],
+    ];
+
+    for (const args of combinations) {
+      const option = legacyCall(...args);
+      expect(option.type, `args: ${JSON.stringify(args)}`).toBe("select");
+      expect(option.currentValue, `args: ${JSON.stringify(args)}`).toBe(
+        args[0] === true ? FAST_MODE_ON : FAST_MODE_OFF,
+      );
+      expect(option.options, `args: ${JSON.stringify(args)}`).toEqual([
+        { value: FAST_MODE_ON, name: "On" },
+        { value: FAST_MODE_OFF, name: "Off" },
+      ]);
+    }
   });
 
   it("emits the on/off select for enabled=true", () => {

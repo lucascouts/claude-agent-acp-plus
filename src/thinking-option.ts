@@ -5,11 +5,15 @@
  * session's thinking intent with the legacy `MAX_THINKING_TOKENS` env
  * resolution into the SDK's `thinking` option.
  *
- * Kept self-contained (no import from the daily-churning `acp-agent.ts`,
- * mirroring the `ask-user-question-fallback.ts` precedent) so the logic is
- * unit-testable in isolation; `acp-agent.ts` wires it into
- * `buildConfigOptions`/`setSessionConfigOption`/query creation in sub-tasks
- * 1.2/1.3.
+ * Kept self-contained — no import from `acp-agent.ts`; what this module needs
+ * from the adapter (a logger, the raw env value) is injected instead, which
+ * also leaves the logic unit-testable in isolation. This mirrors the
+ * `rewind-command.ts` precedent, likewise isolated from the adapter so it can
+ * be unit tested without a live SDK session. The reason is merge cost:
+ * `acp-agent.ts` is a ~7,900-line file that changes upstream almost daily, so
+ * every coupling to it is paid again at each sync. `acp-agent.ts` wires these
+ * helpers into `buildConfigOptions`, `setSessionConfigOption` and query
+ * creation.
  */
 
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
@@ -77,9 +81,9 @@ export function resolveThinkingSelection(value: unknown): boolean | null {
  * it); `0` → disabled; a positive integer → a fixed token budget. Anything
  * else is ignored with a logged error, i.e. treated as unset.
  *
- * NOTE: duplicated from the unexported `resolveThinkingConfig` in
- * `acp-agent.ts` (behavior and log message identical); sub-task 1.3 makes
- * `acp-agent.ts` consume this export and removes the duplication.
+ * This is the single source of truth for that translation: `acp-agent.ts`
+ * carries no copy of it and reaches it only through `effectiveThinkingConfig`
+ * below.
  *
  * @param raw The raw `MAX_THINKING_TOKENS` value (pass
  *   `process.env.MAX_THINKING_TOKENS`).

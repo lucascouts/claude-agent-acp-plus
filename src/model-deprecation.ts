@@ -3,11 +3,16 @@ import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 /**
  * Model deprecation heuristic.
  *
- * The Claude Agent SDK's `ModelInfo` (0.3.204) exposes NO deprecation flag —
- * its only capability fields are `supportsEffort` / `supportedEffortLevels`,
- * `supportsAdaptiveThinking`, `supportsFastMode`, and `supportsAutoMode`. There
+ * The Claude Agent SDK's `ModelInfo` exposes NO deprecation flag — its only
+ * capability fields are `supportsEffort` / `supportedEffortLevels`,
+ * `supportsAdaptiveThinking`, `supportsFastMode`, and `supportsAutoMode`
+ * (`resolvedModel` is an alias-resolution hint, not a lifecycle signal). There
  * is therefore no authoritative, machine-readable signal telling a host that a
  * model row has been retired.
+ *
+ * LAST VERIFIED AGAINST SDK 0.3.220 (story 008, R5.5) — the type is byte-for-byte
+ * unchanged from 0.3.204/0.3.212, so the heuristic below is still necessary.
+ * Re-check this claim on every SDK bump and update the version named here.
  *
  * As a stand-in this module scans the human-facing copy — `displayName` and
  * `description` — for the words "deprecated" or "legacy" (case-insensitive).
@@ -35,7 +40,7 @@ const DEPRECATION_MARKER = /deprecated|legacy/i;
  * `undefined`, or empty `displayName` or `description` is treated as an empty
  * string, so this never throws.
  *
- * See the module doc for WHY this is a heuristic (SDK 0.3.204 `ModelInfo` has no
+ * See the module doc for WHY this is a heuristic (SDK 0.3.220 `ModelInfo` has no
  * deprecation field).
  *
  * @param info - A single SDK model row.

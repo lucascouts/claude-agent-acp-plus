@@ -59,6 +59,8 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  EffortLevel,
+  FastModeDisabledReason,
   FastModeState,
   getSessionInfo,
   getSessionMessages,
@@ -74,7 +76,6 @@ import {
   PermissionUpdate,
   Query,
   query,
-  Settings,
   SDKAssistantMessageError,
   SDKMessage,
   SDKMessageOrigin,
@@ -104,10 +105,6 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
-import {
-  askUserQuestionFallbackEnabled,
-  handleAskUserQuestionViaPermission,
-} from "./ask-user-question-fallback.js";
 import { agentName } from "./agent-name.js";
 import { filterDeprecatedModels } from "./model-deprecation.js";
 import { SettingsManager } from "./settings.js";
@@ -214,6 +211,78 @@ const QUERY_RECREATE_INIT_TIMEOUT_MS = 30_000;
 const TURN_NO_RESULT_MESSAGE =
   "The turn ended without a result: the agent went idle while this prompt was still in flight " +
   "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
+
+/** Custom (extension) request method a client uses to steer the turn that is
+ *  currently running: the message is injected into the in-flight turn rather
+ *  than queued as a separate `session/prompt`. Named `_session/steering` per the
+ *  agreed ACP steering wire protocol; advertised to clients via the top-level
+ *  `InitializeResponse._meta.steering.supported`. */
+const STEER_METHOD = "_session/steering";
+
+/** How urgently the SDK delivers a steered message relative to the running
+ *  turn — an internal Claude implementation detail, not part of the wire
+ *  contract. `now` pre-empts the current generation and handles the message
+ *  immediately (interrupting a single-shot response, or slotting in between a
+ *  multi-step turn's tool calls). Maps to `SDKUserMessage.priority`; injected
+ *  steering always uses `now` so the running turn adapts as soon as possible. */
+const STEER_PRIORITY = "now" as const;
+
+/** Request-level steering options. `promptRequired` is opt-in so existing Hosts
+ *  keep the established idle fallback behavior. */
+type SteerMeta = {
+  [key: string]: unknown;
+  steering?: {
+    idleBehavior?: "promptRequired";
+  };
+};
+
+/** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
+ *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
+ *  priority is deliberately NOT exposed here — it's an internal detail the agent
+ *  chooses (see {@link STEER_PRIORITY}). */
+export type SteerRequest = {
+  sessionId: string;
+  prompt: PromptRequest["prompt"];
+  _meta?: SteerMeta | null;
+};
+
+/** Result of a {@link STEER_METHOD} request. The legacy `startedNewTurn` result
+ *  remains the default idle behavior; `promptRequired` is returned only when the
+ *  Host explicitly opts into the host-owned fallback in request `_meta`. */
+export type SteerResponse =
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
+
+/** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
+ *  content blocks are handed to `promptToClaude`, which tolerates unknown block
+ *  types — but `sessionId` and a non-empty `prompt` array are required. */
+function parseSteerRequest(params: unknown): SteerRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "steer params must be an object");
+  }
+  const { sessionId, prompt, _meta } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
+  }
+  if (!Array.isArray(prompt) || prompt.length === 0) {
+    throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
+  }
+  const steering =
+    _meta && typeof _meta === "object" ? (_meta as Record<string, unknown>).steering : undefined;
+  const idleBehavior =
+    steering && typeof steering === "object"
+      ? (steering as Record<string, unknown>).idleBehavior
+      : undefined;
+  if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
+    throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  }
+  return {
+    sessionId,
+    prompt: prompt as PromptRequest["prompt"],
+    _meta: _meta as SteerMeta | null | undefined,
+  };
+}
 
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
@@ -401,6 +470,13 @@ type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Why the SDK currently can't serve Fast mode, when the reason is one worth
+   *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
+   *  routine states like the SDK's own opt-in requirement normalize to
+   *  `undefined`). Refreshed from every `fast_mode_disabled_reason` the SDK
+   *  reports on `system`/init and user-turn `result`s; surfaced in the Fast mode
+   *  option's description so a toggle that snaps back off explains itself. */
+  fastModeDisabledReason?: FastModeDisabledReason;
   /** Tri-state Thinking intent (story 006): `true`/`false` once the client has
    *  set the Thinking config option, `undefined` while untouched — i.e. the
    *  env-driven `MAX_THINKING_TOKENS` behavior stays in charge (R1.6). Mirrors
@@ -445,13 +521,37 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
+  /** Whether nested subagent text/thinking is forwarded to the ACP client.
+   *  Enabled by either the ACP capability or the pre-existing SDK option. */
+  forwardSubagentText: boolean;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Seeded from the SDK's
-   *  getContextUsage report at session creation (DEFAULT_CONTEXT_WINDOW when
-   *  that and the text heuristic both fail), refreshed the same way on model
-   *  switches, and confirmed by each result's modelUsage. */
+   *  before the turn's first result message arrives. Seeded synchronously at
+   *  session creation and on model switches from the per-model cache or the
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
+   *  resumed session's own `getContextUsage` report wins, see
+   *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
+   *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
+   *  fresh session it stalls until the first turn runs (see the seeding call
+   *  sites and `contextWindowCache`). */
   contextWindowSize: number;
+  /** Whether `contextWindowSize` came from an authoritative source (the
+   *  cross-session cache, a resumed session's `getContextUsage` report, or a
+   *  `result.modelUsage`) rather than the text heuristic / default. Guards the
+   *  mid-stream `message_start` heuristic upgrade: an authoritative window that
+   *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
+   *  and clobbered by a "1m" text match. */
+  contextWindowAuthoritative: boolean;
+  /** Stable identifier of the LLM backend this session's query was created
+   *  against, derived from the routing-relevant vars of the exact `env` handed
+   *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
+   *  window is a property of (model id, backend) — the same resolved model id
+   *  can name different windows behind different base URLs, routing headers, or
+   *  credentials — so this scopes the module-global `contextWindowCache` per
+   *  backend. Captured from the query's own env (not re-resolved later) because
+   *  the process-wide provider config can change while a session is being
+   *  created, while the query stays baked to the env it was created with. */
+  providerCacheKey: string;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -771,12 +871,28 @@ export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
+    /* A human-readable title supplied by Claude Code for the tool call. */
+    title?: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
        Agent/Task call that spawned the subagent. Mirrors the SDK's
        `parent_tool_use_id` on streamed subagent messages. */
     parentToolUseId?: string;
+    /* On a "failed" tool_call_update: why the tool never actually ran, so a
+       client can render the denial/cancellation distinctly from a real tool
+       failure. From the SDK's `tool_result_meta` non_execution_kind:
+       "user-rejected", "permission-rule", "interrupted", "cancelled", …
+       (open set). Absent when the tool executed — including real failures. */
+    nonExecutionKind?: string;
+    /* Free-text the user supplied when rejecting the tool call, when the
+       harness collected any. Only ever present alongside nonExecutionKind. */
+    userFeedback?: string;
+    /* Marks Agent/Task tool calls as subagent launches. ACP 1.2 has no
+       standard subagent ToolKind yet, so clients that support nested
+       transcripts need a namespaced marker instead of inferring from
+       `toolName` or the generic `think` kind. */
+    subagent?: true;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -792,6 +908,28 @@ export type ToolUpdateMeta = {
     signal: string | null;
   };
 };
+
+const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
+
+function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
+  return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
+}
+
+function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
+  if (!("parent_tool_use_id" in message)) return null;
+  return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+function stripSubagentTextAndThinking(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.filter(
+    (item) =>
+      !item ||
+      typeof item !== "object" ||
+      !("type" in item) ||
+      (item.type !== "text" && item.type !== "thinking"),
+  );
+}
 
 export type ToolUseCache = {
   [key: string]: {
@@ -1401,6 +1539,14 @@ export class ClaudeAcpAgent {
         ...terminalAuthMethods,
         ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
       ],
+      // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
+      // steering extension contract: advertises the `_session/steering` request
+      // so clients know they may inject a follow-up into a running turn.
+      _meta: {
+        steering: {
+          supported: true,
+        },
+      },
     };
   }
 
@@ -1628,6 +1774,12 @@ export class ClaudeAcpAgent {
     // those paths.
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
+    // Learned context windows are per-account state too: 1M-context
+    // entitlement is gated per org/tier, and an OAuth re-login is invisible to
+    // the env-derived provider cache key, so windows learned under the old
+    // login must not seed sessions under the next. Worst case of clearing is
+    // re-learning on each model's next turn.
+    contextWindowCache.clear();
 
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
@@ -1788,6 +1940,75 @@ export class ClaudeAcpAgent {
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     return response;
+  }
+
+  /** Steer the session per the ACP steering wire protocol: inject a follow-up
+   *  message into the turn that is currently running. If that turn already
+   *  settled, the established default starts a new detached turn; Hosts may opt
+   *  into the host-owned `promptRequired` fallback through request `_meta`.
+   *
+   *  When a turn is in flight this injects (returns `injected`): unlike
+   *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
+   *  an `SDKUserMessage` onto the same streaming input, which the SDK routes
+   *  into the in-flight turn. The injected message's echo carries a uuid that
+   *  matches no queued turn, so the consumer drops it as an unrelated replay
+   *  without promoting/settling anything. It is delivered at {@link
+   *  STEER_PRIORITY} (`now`) so it pre-empts the current generation (interrupting
+   *  a single-shot response, or slotting in between a multi-step turn's tool
+   *  calls). The steered message's own output streams via `session/update`, not
+   *  this response.
+   *
+   *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
+   *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
+   *  stays Host-owned so the Host can submit it through a standard
+   *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
+   *  `startedNewTurn` result are preserved for compatibility. */
+  async steer(params: SteerRequest): Promise<SteerResponse> {
+    const sessionId = params.sessionId;
+    const session = this.sessions[sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+
+    // "A turn is running" = the queue holds an unsettled turn. This covers both
+    // the activated turn and one just submitted but not yet echoed/activated,
+    // which is exactly the window in which steering is meaningful. This check
+    // and the active-path push below stay in one synchronous section so the
+    // turn cannot settle in the gap between deciding to inject and enqueueing.
+    const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
+    if (!turnInFlight) {
+      const promptRequest: PromptRequest = {
+        sessionId,
+        prompt: params.prompt,
+      };
+      if (params._meta?.steering?.idleBehavior === "promptRequired") {
+        // The opt-in path leaves the content untouched so the Host can retry via
+        // a normal session/prompt whose lifecycle owns the continuation result.
+        return { outcome: "promptRequired", reason: "noRunningTurn" };
+      }
+
+      // Preserve the established default for Hosts that do not opt in. This is
+      // intentionally detached for compatibility with the existing contract.
+      this.prompt(promptRequest).catch((error) => {
+        this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
+      });
+      return { outcome: "startedNewTurn" };
+    }
+
+    const promptRequest: PromptRequest = {
+      sessionId,
+      prompt: params.prompt,
+    };
+    const userMessage = promptToClaude(promptRequest);
+    userMessage.uuid = randomUUID();
+    // Deliver into the running turn rather than queuing behind it as a fresh
+    // prompt would.
+    userMessage.priority = STEER_PRIORITY;
+    session.input.push(userMessage);
+    return { outcome: "injected" };
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
@@ -2477,7 +2698,12 @@ export class ClaudeAcpAgent {
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
-                await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
+                await this.syncFastModeState(
+                  message.session_id,
+                  session,
+                  message.fast_mode_state,
+                  message.fast_mode_disabled_reason,
+                );
                 break;
               case "status": {
                 // These banners count as delivered text (via sendUpdate), so
@@ -2703,9 +2929,9 @@ export class ClaudeAcpAgent {
                 // Push the full slash-command list after a mid-session change
                 // (e.g. skills discovered dynamically as the agent works in a
                 // subdirectory). The client should REPLACE its cached command
-                // list with this payload: supportedCommands() is captured once
-                // at initialize and never reflects mid-session changes, so we
-                // forward message.commands directly rather than re-querying.
+                // list with this payload. Forward message.commands directly —
+                // it's authoritative, and re-querying supportedCommands()
+                // would just return the same list with an extra round-trip.
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -2731,6 +2957,28 @@ export class ClaudeAcpAgent {
                 // already emitted as a `tool_call`, so mark it failed with the
                 // rejection reason — otherwise the client shows a tool call
                 // that silently never resolves.
+                //
+                // The id is the executing call's own, and the frame lands
+                // between its `tool_use` and its `tool_result` (the SDK enqueues
+                // it from inside canUseTool), so the call is normally in flight
+                // here. Not always: the assistant message carrying the tool_use
+                // is dropped by the cancelled-turn guard below, and a denial for
+                // it can still arrive afterwards — the case the `tool_result`
+                // fallback in `toAcpNotifications` gates on `wasEmitted` for.
+                // Drop the update rather than reference a tool call the client
+                // was never given (see `ensureToolCallEmitted`, issue #851).
+                if (!session.emittedToolCalls.has(message.tool_use_id)) {
+                  break;
+                }
+                // A denial inside a subagent identifies the subagent by
+                // `agent_id` (as canUseTool does with `agentID`), never by the
+                // Agent/Task call that spawned it. Resolve it the same way so
+                // the update lands in the subagent's transcript alongside the
+                // `tool_call` it resolves, which carries the parent stamped from
+                // `parent_tool_use_id` (see `liveBackgroundTasks`).
+                const parentToolUseId = message.agent_id
+                  ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
+                  : undefined;
                 const reason = message.decision_reason ?? message.message;
                 await sendUpdate({
                   sessionId: message.session_id,
@@ -2747,6 +2995,7 @@ export class ClaudeAcpAgent {
                     _meta: {
                       claudeCode: {
                         toolName: message.tool_name,
+                        ...(parentToolUseId ? { parentToolUseId } : {}),
                         toolResponse: {
                           decisionReasonType: message.decision_reason_type,
                           decisionReason: message.decision_reason,
@@ -2987,7 +3236,12 @@ export class ClaudeAcpAgent {
               // an autonomous cycle's state lands on the next user turn's
               // result. Runs even when the turn errors or was cancelled.
               if (!isAutonomousResult) {
-                await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+                await this.syncFastModeState(
+                  params.sessionId,
+                  session,
+                  message.fast_mode_state,
+                  message.fast_mode_disabled_reason,
+                );
               }
 
               // A user-turn result needs an active turn so its stop reason is
@@ -3068,12 +3322,43 @@ export class ClaudeAcpAgent {
               const matchingModelUsage = lastAssistantModel
                 ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
                 : null;
-              // Only overwrite when we have an authoritative value — a miss
-              // (e.g. a turn with no top-level assistant message) would
-              // otherwise discard the window learned on a prior turn and
-              // leave the next prompt's mid-stream updates reporting 200k.
-              if (matchingModelUsage) {
-                session.contextWindowSize = matchingModelUsage.contextWindow;
+              // Only overwrite when we have an authoritative, sane value. A miss
+              // (e.g. a turn with no top-level assistant message), or a
+              // nonsensical non-positive/NaN window (observed from third-party
+              // backends), would otherwise discard the window learned on a prior
+              // turn and leave the next prompt's mid-stream updates reporting a
+              // wrong size. `cacheContextWindow` applies the same `> 0` guard, so
+              // a bad value never reaches the cross-session cache either.
+              if (
+                matchingModelUsage &&
+                typeof matchingModelUsage.usage.contextWindow === "number" &&
+                matchingModelUsage.usage.contextWindow > 0
+              ) {
+                session.contextWindowSize = matchingModelUsage.usage.contextWindow;
+                session.contextWindowAuthoritative = true;
+                // Authoritative: fold it into the cross-session cache keyed on
+                // (this session's provider, the resolved model id —
+                // matchingModelUsage.key, e.g. "claude-sonnet-5[1m]") so a later
+                // session/new or switch on the same provider that resolves to
+                // this model seeds the correct window synchronously, with no
+                // getContextUsage IPC.
+                cacheContextWindow(
+                  contextWindowCacheKey(session.providerCacheKey, matchingModelUsage.key),
+                  matchingModelUsage.usage.contextWindow,
+                );
+                // Also cache under the assistant message's own (bare) spelling.
+                // Seed-time reads fall back to a picker value / verbatim live id
+                // when a row carries no resolvedModel (the synthesized
+                // out-of-allowlist resume row sets it undefined on purpose), and
+                // those spellings match `.model` from the assistant message, not
+                // the decorated modelUsage key — without this entry such rows
+                // could never hit the cache.
+                if (lastAssistantModel && lastAssistantModel !== matchingModelUsage.key) {
+                  cacheContextWindow(
+                    contextWindowCacheKey(session.providerCacheKey, lastAssistantModel),
+                    matchingModelUsage.usage.contextWindow,
+                  );
+                }
               }
 
               // Send usage_update notification
@@ -3345,11 +3630,18 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
-                  // Only upgrade from the default — once the SDK has given us
-                  // an authoritative window (seeded at session creation,
-                  // refreshed on model switches in `applyConfigOptionValue`,
-                  // confirmed by each `result`), trust it over the heuristic.
-                  if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
+                  // Only upgrade from the heuristic default — once we have an
+                  // authoritative window (cache-seeded at session creation or
+                  // on a model switch, read from the resumed session on
+                  // session/load, confirmed by each `result`), trust it over
+                  // the heuristic. The flag, not the value, is the sentinel: an
+                  // authoritative window can legitimately equal
+                  // DEFAULT_CONTEXT_WINDOW (e.g. a backend serving a 200k lane
+                  // under a "[1m]"-spelled id) and must not be clobbered.
+                  if (
+                    !session.contextWindowAuthoritative &&
+                    session.contextWindowSize === DEFAULT_CONTEXT_WINDOW
+                  ) {
                     const inferred = inferContextWindowFromModel(model);
                     if (inferred !== null) {
                       session.contextWindowSize = inferred;
@@ -3634,11 +3926,15 @@ export class ClaudeAcpAgent {
               // Consumed: reset so the next message's blocks accumulate fresh and
               // the record stays bounded to the in-flight message.
               streamedBlocks.length = 0;
-            } else if (message.type === "assistant") {
-              // Subagent assistant message (`parent_tool_use_id !== null`). It is
-              // never streamed live and its text/thinking is internal to the tool
-              // call — keep dropping it so subagent prose doesn't leak into the
-              // top-level feed.
+            } else if (
+              message.type === "assistant" &&
+              !(session.forwardSubagentText || supportsSubagentTranscript(this.clientCapabilities))
+            ) {
+              // Legacy clients don't understand nested transcripts. Keep the
+              // historical behavior for them: subagent text/thinking remains
+              // internal to the tool call instead of leaking into the top-level
+              // feed. Capable clients opt into the branch above unchanged, with
+              // `parentToolUseId` stamped by toAcpNotifications.
               content = message.message.content.filter(
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
@@ -3661,6 +3957,12 @@ export class ClaudeAcpAgent {
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
+                // On the wire since CLI 2.1.216 but not in SDKUserMessage's
+                // type, hence the cast. Validated by parseToolResultMeta.
+                toolResultMeta:
+                  message.type === "user"
+                    ? (message as { tool_result_meta?: unknown }).tool_result_meta
+                    : undefined,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -3672,16 +3974,48 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
+            // Not every beat reports under the id of a tool call the client has
+            // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
+            // `agent_api_retry` beats behind `subagentRetry` report under
+            // `agent_<assistant_message_id>`. Forwarding those verbatim leaves the
+            // client resolving an id it has never been told about (the same trap
+            // `ensureToolCallEmitted` documents for #851). The SDK stamps
+            // `parent_tool_use_id` with the executing tool's real id whenever the
+            // beat doesn't carry one of its own, so fall back to it rather than
+            // pattern-matching each synthetic id shape. Beats that do report a real
+            // id (a subagent's `bash_progress`, whose parent is the spawning Agent
+            // call) keep resolving to that id.
+            const toolCallId = session.emittedToolCalls.has(message.tool_use_id)
+              ? message.tool_use_id
+              : message.parent_tool_use_id;
+            // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
+            // beat that races past completion from reopening a finished call.
+            if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
+              break;
+            }
             await sendUpdate({
               sessionId: message.session_id,
               update: {
                 sessionUpdate: "tool_call_update",
-                toolCallId: message.tool_use_id,
+                toolCallId,
                 status: "in_progress",
                 _meta: {
                   claudeCode: {
                     toolName: message.tool_name,
-                    toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                    toolResponse: {
+                      elapsedTimeSeconds: message.elapsed_time_seconds,
+                      // For Agent/Task calls: the subagent's type, and — when
+                      // the subagent is waiting out an API rate-limit retry —
+                      // the SDK's retry counters (attempt, max_retries,
+                      // retry_delay_ms, …), forwarded verbatim so clients can
+                      // show why a spawn looks stalled.
+                      ...(message.subagent_type !== undefined && {
+                        subagentType: message.subagent_type,
+                      }),
+                      ...(message.subagent_retry !== undefined && {
+                        subagentRetry: message.subagent_retry,
+                      }),
+                    },
                   },
                 } satisfies ToolUpdateMeta,
               },
@@ -4278,6 +4612,9 @@ export class ClaudeAcpAgent {
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
+    const forwardSubagentText =
+      this.sessions[sessionId]?.forwardSubagentText ??
+      supportsSubagentTranscript(this.clientCapabilities);
 
     for (const message of messages) {
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
@@ -4299,6 +4636,10 @@ export class ClaudeAcpAgent {
 
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
+      const parentToolUseId = parentToolUseIdOf(message);
+      if (message.type === "assistant" && parentToolUseId && !forwardSubagentText) {
+        content = stripSubagentTextAndThinking(content);
+      }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
@@ -4320,6 +4661,7 @@ export class ClaudeAcpAgent {
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
           messageId: replayMessageId,
+          parentToolUseId,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -4420,7 +4762,11 @@ export class ClaudeAcpAgent {
   }
 
   canUseTool(sessionId: string): CanUseTool {
-    return async (toolName, toolInput, { signal, suggestions, toolUseID, agentID }) => {
+    return async (
+      toolName,
+      toolInput,
+      { signal, suggestions, toolUseID, agentID, matchedAskRule },
+    ) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -4466,56 +4812,6 @@ export class ClaudeAcpAgent {
           parentToolUseId,
         );
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
-      }
-
-      // Fallback for clients WITHOUT `elicitation.form`: route each question
-      // through ACP `session/request_permission` dialogs (gated by
-      // ACP_ASKUSERQUESTION_FALLBACK). Placed before ExitPlanMode and the
-      // bypassPermissions early-allow so a question is always asked, even in
-      // bypass mode.
-      if (toolName === "AskUserQuestion" && askUserQuestionFallbackEnabled(process.env)) {
-        // Emit the tool_call before the first permission request (R3.1).
-        await this.ensureToolCallEmitted(sessionId, toolName, toolUseID, toolInput);
-        // Logger has no `debug`; `.error` reaches stderr in all contexts (the CLI
-        // entrypoint also remaps console.log/debug -> stderr), so it never
-        // corrupts the stdout ndJSON protocol. Used by story 002 validation.
-        this.logger.error(
-          "AskUserQuestion: routing via permission fallback (client lacks elicitation.form).",
-        );
-        return handleAskUserQuestionViaPermission(
-          toolInput,
-          async ({ question, options }) => {
-            const response = await this.requestPermissionFromClient(
-              {
-                options,
-                sessionId,
-                toolCall: {
-                  toolCallId: toolUseID,
-                  rawInput: toolInput,
-                  ...toolInfoFromToolUse(
-                    { name: toolName, input: toolInput, id: toolUseID },
-                    supportsTerminalOutput,
-                    session?.cwd,
-                  ),
-                  // Per-question title so the user sees which question they are
-                  // answering; placed AFTER the spread so it wins over the
-                  // tool-derived title.
-                  title: question.question,
-                },
-              },
-              toolName,
-              signal,
-            );
-            // RequestPermissionResponse has a DOUBLE-nested outcome (see the
-            // ExitPlanMode usage below): response.outcome?.outcome is
-            // "selected" | "cancelled".
-            if (response.outcome?.outcome === "selected") {
-              return { outcome: "selected", optionId: response.outcome.optionId };
-            }
-            return { outcome: "cancelled" };
-          },
-          signal,
-        );
       }
 
       if (toolName === "ExitPlanMode") {
@@ -4606,7 +4902,14 @@ export class ClaudeAcpAgent {
         }
       }
 
-      if (session.modes.currentModeId === "bypassPermissions") {
+      // In bypass mode the CLI skips permission checks itself; the asks that
+      // still reach canUseTool are the ones it insists on prompting for even
+      // under --dangerously-skip-permissions. Keep auto-allowing those —
+      // bypass means bypass — EXCEPT rule-forced asks (`matchedAskRule`): the
+      // user explicitly configured a permissions.ask rule for this tool, and
+      // the SDK's guidance is that hosts running auto-approval must treat such
+      // asks as a human prompt. Fall through to the normal request below.
+      if (session.modes.currentModeId === "bypassPermissions" && !matchedAskRule) {
         return {
           behavior: "allow",
           updatedInput: toolInput,
@@ -4850,22 +5153,21 @@ export class ClaudeAcpAgent {
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
-        // The cached context window was learned for the previous model. The
-        // SDK is already running the new model here (user-driven switches call
-        // `query.setModel` before this, and the refusal-fallback sync only
-        // reconciles a switch the SDK already made), so ask it for the new
-        // window; fall back to the text heuristic so mid-stream updates
-        // between now and the next `result` reflect the user's selection
-        // instead of the old model's window.
-        session.contextWindowSize =
-          (await fetchContextWindowSize(session.query, this.logger)) ??
-          inferContextWindowFromModel(
-            value,
-            newModelInfo?.resolvedModel,
-            newModelInfo?.displayName,
-            newModelInfo?.description,
-          ) ??
-          DEFAULT_CONTEXT_WINDOW;
+        // Seed the new model's context window WITHOUT any IPC on the switch
+        // path: cached authoritative value if we've already learned it (from a
+        // prior turn's `result.modelUsage`), else the text heuristic, else the
+        // default. We deliberately do NOT call `getContextUsage` here — before
+        // a fresh session's first prompt turn that control request is not
+        // serviced (~15s stall, issues #886/#880), and (because SDK control
+        // requests are serialized over one channel) it would drag the awaited
+        // `setModel` down with it. The authoritative window arrives on the
+        // first `result.modelUsage` for the model and is cached from there;
+        // until then a switched-to alias that has never run a turn shows the
+        // heuristic/default window, which self-corrects on its first response
+        // (matches pre-0.59.0 behavior).
+        const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
+        session.contextWindowSize = seeded.size;
+        session.contextWindowAuthoritative = seeded.authoritative;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -4906,6 +5208,14 @@ export class ClaudeAcpAgent {
         session.modes = { ...session.modes, availableModes: newAvailableModes };
       }
 
+      // `model_not_allowed` described the model we just left, so it must not
+      // follow us onto the new one; the remaining reasons are account- or
+      // environment-scoped and stay true across a switch. Either way the next
+      // init/result report refreshes this.
+      if (session.fastModeDisabledReason === "model_not_allowed") {
+        session.fastModeDisabledReason = undefined;
+      }
+
       // Rebuild config options since effort levels depend on the selected model
       const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
@@ -4923,6 +5233,7 @@ export class ClaudeAcpAgent {
           // intent) when a supporting model is selected again.
           supported: newModelInfo?.supportsFastMode ?? false,
           enabled: session.fastModeEnabled,
+          disabledReason: session.fastModeDisabledReason,
         },
         // Thinking is model-independent: re-render the retained tri-state
         // intent so the row survives this rebuild (an option not threaded
@@ -5022,12 +5333,13 @@ export class ClaudeAcpAgent {
   }
 
   /** Replace the Fast mode option in `session.configOptions` so it reflects
-   *  `enabled`. A no-op when the option isn't present, so callers must confirm
-   *  the current model surfaces it first. Rebuilds through the single-parameter
-   *  {@link createFastModeConfigOption} — the one source of the option's shape —
-   *  so the shape can't drift from what `buildConfigOptions` first emitted. */
+   *  `enabled` (and the session's current disabled reason). A no-op when the
+   *  option isn't present, so callers must confirm the current model surfaces
+   *  it first. Rebuilds through {@link createFastModeConfigOption} — the one
+   *  source of the option's shape — so the shape can't drift from what
+   *  `buildConfigOptions` first emitted. */
   private refreshFastModeOption(session: Session, enabled: boolean): void {
-    const refreshed = createFastModeConfigOption(enabled);
+    const refreshed = createFastModeConfigOption(enabled, session.fastModeDisabledReason);
     session.configOptions = session.configOptions.map((o) =>
       o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
     );
@@ -5351,11 +5663,19 @@ export class ClaudeAcpAgent {
    *     here).
    *   - `cooldown`: a transient suspension of an already-enabled fast mode.
    *     Leave the toggle as-is rather than flapping it — and never let a stray
-   *     cooldown spuriously enable a toggle the user has off. */
+   *     cooldown spuriously enable a toggle the user has off.
+   *
+   *  `reason` is the SDK's `fast_mode_disabled_reason`, reported alongside the
+   *  state. Only explainable reasons are retained (see
+   *  {@link normalizeFastModeDisabledReason}), so the comparison below tracks
+   *  exactly what the user can see: a routine `sdk_opt_in_required` report on
+   *  every turn's result can't churn the option, while a real blocker updates
+   *  the description even when the toggle's own value is unchanged. */
   private async syncFastModeState(
     sessionId: string,
     session: Session,
     state: FastModeState | undefined,
+    reason?: FastModeDisabledReason,
   ): Promise<void> {
     if (state === undefined) {
       return;
@@ -5367,11 +5687,31 @@ export class ClaudeAcpAgent {
       return;
     }
     const enabled = state === "on";
-    if (enabled === session.fastModeEnabled) {
+    // A reason only describes an off state; drop any that rides an `on` report
+    // so it can't decorate the option the next time fast mode goes off.
+    const nextReason = enabled ? undefined : normalizeFastModeDisabledReason(reason);
+    if (enabled === session.fastModeEnabled && nextReason === session.fastModeDisabledReason) {
       return;
     }
+    // The user asked for Fast mode and the SDK is telling us it can't serve it.
+    // The description carries the same explanation, but a toggle silently
+    // snapping back is the case worth saying out loud once, at the flip.
+    const explain = session.fastModeEnabled && !enabled && nextReason !== undefined;
     session.fastModeEnabled = enabled;
+    session.fastModeDisabledReason = nextReason;
     this.refreshFastModeOption(session, enabled);
+    if (explain) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `**Fast mode turned off:** ${FAST_MODE_UNAVAILABLE_EXPLANATIONS[nextReason]}.`,
+          },
+        },
+      });
+    }
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -5536,6 +5876,9 @@ export class ClaudeAcpAgent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
+    const forwardSubagentText =
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      userProvidedOptions?.forwardSubagentText === true;
 
     // Configure thinking behavior through the same single code path query
     // recreation uses (`recreateSessionQuery`). A fresh session's Thinking
@@ -5559,14 +5902,9 @@ export class ClaudeAcpAgent {
     };
 
     // AskUserQuestion surfaces as a `permission_ask_user_question` dialog that
-    // we render as a form elicitation. Without form-elicitation support we fall
-    // back to sequential ACP `session/request_permission` dialogs when the
-    // fallback gate is on (the default); set ACP_ASKUSERQUESTION_FALLBACK=0 to
-    // keep it disabled, exactly as upstream does.
-    const disallowedTools =
-      elicitationSupport.form || askUserQuestionFallbackEnabled(process.env)
-        ? []
-        : ["AskUserQuestion"];
+    // we render as a form elicitation. Without form-elicitation support there
+    // is no way to present it over ACP, so keep it disabled in that case.
+    const disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -5582,6 +5920,29 @@ export class ClaudeAcpAgent {
     // below) so the TaskCreated/TaskCompleted hook callbacks can close over
     // the same Map that the streaming message handler will read from.
     const taskState: TaskState = new Map();
+
+    // The exact env the query will be created with. Built (and the provider
+    // cache key derived from it, below) in one place so the key always
+    // describes the backend this query actually talks to: `providers/set`,
+    // `providers/disable`, and `logout` mutate the process-wide provider
+    // config concurrently, so re-resolving it after any of the awaits between
+    // here and the session registration could disagree with the env baked
+    // into the query.
+    const env = {
+      ...process.env,
+      ...userProvidedOptions?.env,
+      // Client-managed LLM routing: `providers/set` config wins, else the
+      // legacy gateway auth request. Baked into the query at creation, so it
+      // only affects sessions started after the change (matching the RFD).
+      ...createEnvForProvider(this.resolveProviderConfig()),
+      // Opt-in to session state events like when the agent is idle
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+    };
+    // Scopes the context-window cache to this query's backend (see
+    // `contextWindowCache`). Derived from the same `env` object handed to the
+    // SDK, so per-session `_meta` env routing and ambient process-env routing
+    // are distinguished exactly as the CLI will see them.
+    const providerCacheKey = providerCacheKeyFor(env);
 
     const options: Options = {
       systemPrompt,
@@ -5603,19 +5964,11 @@ export class ClaudeAcpAgent {
             ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
           },
         }),
-      env: {
-        ...process.env,
-        ...userProvidedOptions?.env,
-        // Client-managed LLM routing: `providers/set` config wins, else the
-        // legacy gateway auth request. Baked into the query at creation, so it
-        // only affects sessions started after the change (matching the RFD).
-        ...createEnvForProvider(this.resolveProviderConfig()),
-        // Opt-in to session state events like when the agent is idle
-        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
-      },
+      env,
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
       includePartialMessages: true,
+      forwardSubagentText,
       mcpServers: { ...(userProvidedOptions?.mcpServers || {}), ...mcpServers },
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
@@ -5654,7 +6007,7 @@ export class ClaudeAcpAgent {
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
             hooks: [
-              createPostToolUseHook(this.logger, {
+              createPostToolUseHook({
                 onEnterPlanMode: async () => {
                   await this.client.sessionUpdate({
                     sessionId,
@@ -5800,7 +6153,7 @@ export class ClaudeAcpAgent {
         )
       : hideDeprecatedModels(initializationResult.models, this.logger);
 
-    const models = await getAvailableModels(
+    const { modelState: models, resumedContextWindow } = await getAvailableModels(
       q,
       catalogModels,
       allowedModels,
@@ -5908,9 +6261,17 @@ export class ClaudeAcpAgent {
     const fastModeEnabled =
       initializationResult.fast_mode_state !== undefined &&
       fastModeStateEnabled(initializationResult.fast_mode_state);
+    // `fast_mode_disabled_reason` reflects the post-switch model since SDK
+    // 0.3.219 (the initialize response used to answer from the spawn-time
+    // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
+    // the opt-in — which normalizes away, so only real blockers are retained.
+    const fastModeDisabledReason = fastModeEnabled
+      ? undefined
+      : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
     const fastMode: FastModeOptionState = {
       supported: currentModelInfo?.supportsFastMode ?? false,
       enabled: fastModeEnabled,
+      disabledReason: fastModeDisabledReason,
     };
 
     const configOptions = buildConfigOptions(
@@ -5943,31 +6304,41 @@ export class ClaudeAcpAgent {
       initialEffort.currentValue !== "default"
     ) {
       await q.applyFlagSettings({
-        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+        effortLevel: toSdkEffortLevel(initialEffort.currentValue),
       });
     }
-    // Seed the context window from the SDK's authoritative report. Text
-    // inference alone misses aliases that resolve to extended-context models
-    // with no "1m" token anywhere in their id or description (e.g. `sonnet` →
-    // claude-sonnet-5, natively ~1M): those streamed `usage_update.size:
-    // 200000` until the first result's modelUsage corrected it — again on
-    // every process restart or session re-creation, since the learned window
-    // lives only on the Session (issue #596).
+    // Seed the context window WITHOUT any extra IPC on the session/new path.
+    // On session/load, the resumed session's own `getContextUsage` report — a
+    // response `getAvailableModels` already awaited to learn the live model
+    // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
+    // authoritative and wins. Otherwise: the cached authoritative window if a
+    // prior turn has learned it for this model (`result.modelUsage`,
+    // cross-session), else the text heuristic, else the default. We
+    // deliberately do NOT issue a getContextUsage call here: on a fresh
+    // session that control request is not serviced until the first prompt
+    // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
+    // (issues #886/#880). The authoritative window arrives on the first
+    // `result.modelUsage` and is cached from there.
     //
-    // The inference fallback is deliberately keyed to the allowlisted entry: a
+    // Text inference alone misses aliases that resolve to extended-context
+    // models with no "1m" token anywhere in their id or description (e.g.
+    // `sonnet` → claude-sonnet-5, natively ~1M): those stream
+    // `usage_update.size: 200000` until the first result's modelUsage corrects
+    // it — but the cache means only the FIRST session to ever run a turn on such
+    // a model eats that window, not every fresh session after a process
+    // restart (issue #596; a post-restart session/load is covered by the
+    // resumed report above).
+    //
+    // The inference fallback is deliberately keyed to the catalog entry (the
+    // fork's unfiltered lookup, see `catalogModelInfo` above): a
     // fallback-resolved sibling's resolvedModel/displayName/description can
     // describe a different context lane than the verbatim live id (e.g. an
     // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
     // the id itself is a trustworthy window signal.
-    const contextWindowSize =
-      (await fetchContextWindowSize(q, this.logger)) ??
-      inferContextWindowFromModel(
-        models.currentModelId,
-        catalogModelInfo?.resolvedModel,
-        catalogModelInfo?.displayName,
-        catalogModelInfo?.description,
-      ) ??
-      DEFAULT_CONTEXT_WINDOW;
+    const seededWindow =
+      resumedContextWindow !== null
+        ? { size: resumedContextWindow, authoritative: true }
+        : immediateContextWindow(providerCacheKey, models.currentModelId, catalogModelInfo);
 
     this.sessions[sessionId] = {
       query: q,
@@ -5996,9 +6367,13 @@ export class ClaudeAcpAgent {
       agents,
       currentAgent,
       fastModeEnabled,
+      fastModeDisabledReason,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      contextWindowSize,
+      forwardSubagentText,
+      contextWindowSize: seededWindow.size,
+      contextWindowAuthoritative: seededWindow.authoritative,
+      providerCacheKey,
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -6234,9 +6609,12 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
 // and only clears a key when an explicit `null` is sent — see
 // `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
 // `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared.
-function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | null {
-  return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
+// `null` ensures any previously-applied flag is actually cleared. Typed as
+// `EffortLevel` (not `Settings["effortLevel"]`): the picker offers whatever
+// `supportedEffortLevels` reports, which includes the session-scoped `"max"`
+// that the persisted Settings shape deliberately excludes.
+function toSdkEffortLevel(value: string | undefined): EffortLevel | null {
+  return value === undefined || value === "default" ? null : (value as EffortLevel);
 }
 
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
@@ -6298,17 +6676,65 @@ export function fastModeStateEnabled(state: FastModeState): boolean {
   return state !== "off";
 }
 
+/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values
+ *  that a user can act on (or at least wants to know about). Deliberately
+ *  partial — the omitted reasons are not worth surfacing:
+ *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
+ *     opt-in), so it describes the default, not a problem.
+ *   - `preference`: the user turned Fast mode off themselves.
+ *   - `pending`: eligibility is still resolving; the next report supersedes it.
+ *   - `unknown`: nothing meaningful to say.
+ *  Unknown future reasons fall through the same way (open set — the SDK's docs
+ *  say to ignore values you don't handle). */
+const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason, string>> = {
+  free: "not available on the free plan",
+  extra_usage_disabled: "requires extra usage to be enabled for this account",
+  model_not_allowed: "not available for the selected model",
+  not_first_party: "not available on this API provider",
+  disabled_by_env: "disabled by environment configuration",
+  network_error: "eligibility could not be verified (network error)",
+};
+
+/** Normalize an SDK-reported `fast_mode_disabled_reason` to the one we retain:
+ *  a reason we have an explanation for, else `undefined`. Keeping only
+ *  explainable reasons means state comparisons (see `syncFastModeState`) track
+ *  exactly what the user can see, so routine reports like
+ *  `sdk_opt_in_required` never churn the config option. */
+export function normalizeFastModeDisabledReason(
+  reason: FastModeDisabledReason | undefined,
+): FastModeDisabledReason | undefined {
+  return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
+}
+
 /** Build the Fast mode config option as a two-value on/off `select`. Emitted
- *  for EVERY Client — the boolean option shape is gone (story 006, R2.1). Only
- *  the emitted SHAPE is fixed to a select; boolean VALUES are still honored on
- *  set (see {@link resolveFastModeEnabled}). This factory is the single source
- *  of the option's shape, re-rendered by `refreshFastModeOption` /
- *  `syncFastModeState` so the shape can never desync. */
-export function createFastModeConfigOption(enabled: boolean): SessionConfigOption {
+ *  for EVERY Client — the boolean option shape is gone (story 006, R2.1;
+ *  retained through the v0.64.0 sync by story 008 R3.4). Only the emitted SHAPE
+ *  is fixed to a select; boolean VALUES are still honored on set (see
+ *  {@link resolveFastModeEnabled}). This factory is the single source of the
+ *  option's shape, re-rendered by `refreshFastModeOption` / `syncFastModeState`
+ *  so the shape can never desync.
+ *
+ *  `disabledReason` (the SDK's `fast_mode_disabled_reason`, upstream v0.64.0) is
+ *  folded into the description while the toggle reads off, so a user whose
+ *  account or provider can't serve Fast mode sees why instead of a switch that
+ *  silently refuses to stay on. Ignored while enabled: a reason reported
+ *  alongside an `on`/`cooldown` state isn't blocking anything right now.
+ *
+ *  Upstream's second parameter (`useBooleanOption`) is deliberately absent: the
+ *  shape is unconditionally a select, so there is no branch to select. What
+ *  guards that is behavioural, not structural — `tests/fast-mode-select-only.
+ *  test.ts` proves no argument combination can yield the boolean shape. */
+export function createFastModeConfigOption(
+  enabled: boolean,
+  disabledReason?: FastModeDisabledReason,
+): SessionConfigOption {
+  const explanation = enabled
+    ? undefined
+    : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
   return {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
-    description: FAST_MODE_DESCRIPTION,
+    description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
     category: "model_config",
     type: "select",
     currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
@@ -6341,6 +6767,9 @@ export function resolveFastModeEnabled(params: { value: unknown }): boolean {
 export type FastModeOptionState = {
   supported: boolean;
   enabled: boolean;
+  /** Latest explainable `fast_mode_disabled_reason`, folded into the option's
+   *  description while the toggle reads off. */
+  disabledReason?: FastModeDisabledReason;
 };
 
 export function buildConfigOptions(
@@ -6424,7 +6853,7 @@ export function buildConfigOptions(
   // option is always emitted as a two-value on/off select for every Client
   // (R2.1); boolean values remain accepted on set for boolean-era clients.
   if (fastMode?.supported) {
-    options.push(createFastModeConfigOption(fastMode.enabled));
+    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.disabledReason));
   }
 
   // Surface the Thinking toggle whenever the caller supplies its display
@@ -6815,20 +7244,29 @@ export function applyAvailableModelsAllowlist(
 
 /** Read the model a resumed session is actually running (via the
  *  `getContextUsage` control request — the same source `/context` prints) and
- *  map it onto the picker. Best-effort: a control-request failure is logged
- *  and returns null so callers keep their current choice; failing the whole
- *  session/load over an unreadable report would be worse. */
+ *  map it onto the picker, along with the report's authoritative context
+ *  window (`rawMaxTokens`). Resumed sessions get this request serviced before
+ *  any turn runs in the new process — unlike fresh sessions, where it stalls
+ *  until the first prompt turn (issues #886/#880) — so the same response that
+ *  restores the live model (issue #845) also seeds the window for free,
+ *  covering post-restart reloads of models the text heuristic misses (issue
+ *  #596). Best-effort: a control-request failure is logged and returns nulls
+ *  so callers keep their current choice; failing the whole session/load over
+ *  an unreadable report would be worse. */
 async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
   logger: Logger,
-): Promise<ModelInfo | null> {
+): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
   try {
-    const liveModel = (await query.getContextUsage()).model;
-    return liveModel ? matchResumedModel(models, liveModel) : null;
+    const usage = await query.getContextUsage();
+    return {
+      model: usage.model ? matchResumedModel(models, usage.model) : null,
+      contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
+    };
   } catch (error) {
     logger.error("Failed to read the resumed session's live model:", error);
-    return null;
+    return { model: null, contextWindow: null };
   }
 }
 
@@ -6847,11 +7285,16 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<SessionModelState> {
+): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
+  // The context window reported alongside a resumed session's live model.
+  // Only ever non-null on the paths where `currentModel` IS the live model
+  // (no override, or a failed override re-assert), so the window always
+  // describes the model the session actually runs.
+  let resumedContextWindow: number | null = null;
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
@@ -6880,7 +7323,9 @@ async function getAvailableModels(
   // the SDK is already running this model, and pushing a picker alias back
   // (e.g. "opus[1m]") could change the live model rather than describe it.
   if (resolvedFromInput === undefined && isResumedSession) {
-    currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
+    const live = await readResumedLiveModel(query, models, logger);
+    currentModel = live.model ?? currentModel;
+    resumedContextWindow = live.contextWindow;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
@@ -6913,17 +7358,26 @@ async function getAvailableModels(
       // pin the session isn't running.
       if (!isResumedSession) throw error;
       logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
+      const live = await readResumedLiveModel(query, models, logger);
+      currentModel = live.model ?? currentModel;
+      resumedContextWindow = live.contextWindow;
     }
   }
 
   return {
-    availableModels: pickerModels.map((model) => ({
-      modelId: model.value,
-      name: model.displayName,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
+    modelState: {
+      // Picker rows come from the DEPRECATION-FILTERED list (`pickerModels`),
+      // not the raw catalog upstream maps here: the filter is visibility-only,
+      // so preference resolution and capability lookups elsewhere keep reading
+      // the unfiltered catalog (R4.3).
+      availableModels: pickerModels.map((model) => ({
+        modelId: model.value,
+        name: model.displayName,
+        description: model.description,
+      })),
+      currentModelId: currentModel.value,
+    },
+    resumedContextWindow,
   };
 }
 
@@ -7067,6 +7521,12 @@ export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
     },
     session_id: prompt.sessionId,
     parent_tool_use_id: null,
+    // ACP prompts are the user's own input relayed by the client. Stamp the
+    // provenance explicitly: per the SDK, a host wrapping keyboard input must
+    // send `{kind: "human"}` — an absent `origin` is treated as unattributed
+    // and fails closed at the CLI's strict isHuman() trust gates (e.g. the
+    // ultracode keyword opt-in honors only human-originated turns).
+    origin: { kind: "human" },
   };
 }
 
@@ -7140,6 +7600,29 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
+ *  are kept out of ACP's standard `title`, which clients may use as the shell
+ *  command preview, while still giving clients access to Claude's concise
+ *  human-readable title. */
+function claudeCodeMetaFromToolUse(toolUse: {
+  name: string;
+  input?: unknown;
+}): NonNullable<ToolUpdateMeta["claudeCode"]> {
+  const description =
+    toolUse.name === "Bash" &&
+    toolUse.input !== null &&
+    typeof toolUse.input === "object" &&
+    "description" in toolUse.input &&
+    typeof toolUse.input.description === "string"
+      ? toolUse.input.description
+      : undefined;
+  return {
+    toolName: toolUse.name,
+    ...(description ? { title: description } : {}),
+    ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
+  };
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -7156,7 +7639,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse) } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -7165,7 +7648,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: { toolName: toolUse.name },
+      claudeCode: claudeCodeMetaFromToolUse(toolUse),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -7200,7 +7683,9 @@ function streamedInputRefinement(
     cwd,
   );
   return {
-    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    _meta: {
+      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }),
+    } satisfies ToolUpdateMeta,
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call_update",
     rawInput: input,
@@ -7208,6 +7693,36 @@ function streamedInputRefinement(
     kind,
     ...(locations ? { locations } : {}),
   };
+}
+
+/** Validates the SDK user message's `tool_result_meta` sidecar (emitted on the
+ *  wire by CLI ≥ 2.1.216 but absent from sdk.d.ts, hence unknown-typed) into a
+ *  by-tool_use_id lookup. Each entry explains why an is_error tool_result
+ *  carries harness prose instead of the tool's own output — "user-rejected",
+ *  "permission-rule", "interrupted", "cancelled", … (open set: new kinds ship
+ *  on the wire ahead of schema updates, so no enum check). Malformed entries
+ *  are skipped rather than failing the message. */
+function parseToolResultMeta(
+  raw: unknown,
+): Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  let byToolUseId: Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined;
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) {
+      continue;
+    }
+    const { id, non_execution_kind, user_feedback } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || typeof non_execution_kind !== "string") {
+      continue;
+    }
+    (byToolUseId ??= new Map()).set(id, {
+      nonExecutionKind: non_execution_kind,
+      ...(typeof user_feedback === "string" ? { userFeedback: user_feedback } : {}),
+    });
+  }
+  return byToolUseId;
 }
 
 /**
@@ -7245,6 +7760,10 @@ export function toAcpNotifications(
     // Agent/Task results from the structured subagent report instead of the raw
     // text (which ends in a model-directed agentId/usage trailer).
     toolUseResult?: unknown;
+    // The SDK user message's `tool_result_meta` sidecar, passed raw (it's
+    // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
+    // denied/interrupted tool_call_updates with why the tool never ran.
+    toolResultMeta?: unknown;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -7286,6 +7805,10 @@ export function toAcpNotifications(
       .length === 1
       ? options.toolUseResult
       : undefined;
+
+  // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
+  // messages need no single-block guard.
+  const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
 
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
@@ -7437,6 +7960,12 @@ export function toAcpNotifications(
       case "mcp_tool_result": {
         const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
+        // Why this is_error result carries harness prose instead of tool
+        // output (user-rejected / interrupted / …), when the SDK said so.
+        // Spread into the claudeCode meta of every update emitted below; the
+        // untracked-tool fallback can't carry it (claudeCode metas always
+        // carry `toolName`, which is unknown there).
+        const nonExecution = toolResultMeta?.get(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           // The permission flow may have surfaced this tool_call even though
@@ -7480,6 +8009,7 @@ export function toAcpNotifications(
               _meta: {
                 claudeCode: {
                   toolName: toolUse.name,
+                  ...(nonExecution ?? {}),
                   ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
                 },
               } satisfies ToolUpdateMeta,
@@ -7551,6 +8081,7 @@ export function toAcpNotifications(
             _meta: {
               claudeCode: {
                 toolName: toolUse.name,
+                ...(nonExecution ?? {}),
               },
               ...(toolMeta?.terminal_exit ? { terminal_exit: toolMeta.terminal_exit } : {}),
             } satisfies ToolUpdateMeta,
@@ -7817,6 +8348,9 @@ export function runAcp() {
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
+    .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
+      agent.steer(ctx.params),
+    )
     .connect(stream);
 
   agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
@@ -7831,9 +8365,9 @@ function commonPrefixLength(a: string, b: string) {
   return i;
 }
 
-/** Best-effort first guess of a model's context window, used only as a
- *  fallback when the SDK's authoritative `getContextUsage` is unavailable (and
- *  until a `result` message arrives with the `modelUsage` value).
+/** Best-effort first guess of a model's context window, used to seed the
+ *  window synchronously (via `immediateContextWindow`) until a `result` message
+ *  arrives with the authoritative `modelUsage` value.
  *
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
@@ -7843,9 +8377,12 @@ function commonPrefixLength(a: string, b: string) {
  *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
  *  This text scan can't catch every model — some resolve to extended-context
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M) — which is why `fetchContextWindowSize` is preferred wherever a live
- *  query is available. A miss falls back to the default window and is
- *  corrected by `result.modelUsage` within one turn. */
+ *  ~1M). Such a miss falls back to the default window and is corrected by
+ *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
+ *  SDK's `getContextUsage` to close that gap: on a fresh session it is not
+ *  serviced before the first prompt turn (issues #886/#880, see
+ *  `contextWindowCache`; resumed sessions do get it, via
+ *  `readResumedLiveModel`). */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
@@ -7866,26 +8403,110 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
   }
 }
 
-/** Fetch the current model's full context window (`rawMaxTokens`) via the
- *  `getContextUsage` control request — the same source `/context` prints.
- *  This is the only pre-`result` signal that covers semantic aliases whose
- *  text carries no "1m" token (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M), so it's the primary window source at session creation and on model
- *  switches; `inferContextWindowFromModel` remains the fallback. A returned
- *  window is still superseded by each `result.modelUsage.contextWindow`.
+/** Cross-session cache of authoritative context windows, keyed by
+ *  `${providerCacheKey}\0${modelId}` (see {@link contextWindowCacheKey}).
+ *  The window is a property of (model id, backend): the same resolved model id
+ *  (e.g. "claude-sonnet-5[1m]", the spelling of the `result.modelUsage` keys)
+ *  can name different context lanes behind different base URLs, routing
+ *  headers, or credentials, so the key carries both. Caching it module-level
+ *  lets a later session/new or switch that resolves to the same (backend,
+ *  model) — in this session or any other, within the adapter's lifetime — seed
+ *  the correct window synchronously with no IPC. Keying on the resolved id
+ *  (rather than the picker value) means aliases that resolve to the same
+ *  concrete model share one entry; the result handler additionally writes the
+ *  bare assistant-message spelling so seed-time reads that fall back to a
+ *  verbatim live id (rows without `resolvedModel`) can hit too.
  *
- *  (Older CLIs under-reported extended 1M windows here — commit 20ef663
- *  dropped the field for that reason — but the CLI vendored by the pinned
- *  SDK reports them correctly again.) Returns `null` on any control-request
- *  failure or a nonsensical (non-positive) window. */
-async function fetchContextWindowSize(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null;
-  } catch (error) {
-    logger.error("Failed to fetch context window size from SDK:", error);
-    return null;
+ *  Populated authoritatively by each `result.modelUsage` a turn confirms (see
+ *  the consumer's result handler). We deliberately never populate it from a
+ *  fresh session's `getContextUsage`: before that session's first prompt turn
+ *  has run the control request is not serviced (it stalls ~15s, and serializes
+ *  ahead of an awaited `setModel` — issues #886/#880, regressed in 0.59.0), so
+ *  it can neither beat the first `result` nor be issued cheaply before one.
+ *  Resumed sessions are the exception — their report IS serviced pre-turn, and
+ *  the session/load path seeds (but does not cache) the window from the same
+ *  response that restores the live model, see `readResumedLiveModel`.
+ *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
+ *  windows learned under one login must not seed sessions under the next. */
+const contextWindowCache = new Map<string, number>();
+
+/** The env vars that determine which LLM backend — and which context lane on
+ *  it — a query's API traffic reaches: endpoint selection (base URLs and the
+ *  Bedrock/Vertex switches with their project/region), routing/beta headers
+ *  (an `anthropic-beta: context-1m-…` header flips the same model id at the
+ *  same endpoint between context lanes), and credential identity (extended
+ *  context is entitlement-gated per account). Used to derive the
+ *  provider-cache key from the exact env a query is created with, so
+ *  `providers/set` config, per-session `_meta` env overrides, and ambient
+ *  process env are all distinguished exactly as the CLI will see them. */
+const PROVIDER_ROUTING_ENV_VARS = [
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "CLOUD_ML_REGION",
+  "AWS_REGION",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+] as const;
+
+/** Stable identifier for the LLM backend a session's query is created against,
+ *  used to scope {@link contextWindowCache} per backend. Positional `\0`-join
+ *  of {@link PROVIDER_ROUTING_ENV_VARS} values, so no segment can masquerade
+ *  as another and unset vars everywhere yield one stable "default" bucket.
+ *  Header/credential values can be secrets; the key only ever lives as an
+ *  in-memory Map key and is never logged or surfaced. Over-keying is the safe
+ *  side: a var change that didn't really change the backend costs one cache
+ *  miss (heuristic seed until the next result), while under-keying would serve
+ *  one backend's window for another's. */
+function providerCacheKeyFor(env: Record<string, string | undefined>): string {
+  return PROVIDER_ROUTING_ENV_VARS.map((name) => env[name] ?? "").join("\0");
+}
+
+/** Compose the `contextWindowCache` key from a session's provider key and a
+ *  model id. `\0`-joined so the model segment can't collide with a provider
+ *  segment. */
+function contextWindowCacheKey(providerCacheKey: string, modelId: string): string {
+  return `${providerCacheKey}\0${modelId}`;
+}
+
+function cacheContextWindow(modelKey: string, window: number): void {
+  if (window > 0) {
+    contextWindowCache.set(modelKey, window);
   }
+}
+
+/** The context window to report *right now* for a model, with NO IPC on the
+ *  critical path: the cached authoritative value if we've learned it (from a
+ *  prior turn's `result.modelUsage`, this or any session on the same backend),
+ *  else the text heuristic over the model row's identity strings, else the
+ *  default. Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
+ *  the same rule at every seed site — so read keys can't drift from the write
+ *  site's spelling. `authoritative` reports whether the value came from the
+ *  cache: an authoritative window can legitimately equal
+ *  DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the caller. */
+function immediateContextWindow(
+  providerCacheKey: string,
+  modelId: string,
+  modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
+): { size: number; authoritative: boolean } {
+  const cached = contextWindowCache.get(
+    contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
+  );
+  if (cached !== undefined) return { size: cached, authoritative: true };
+  return {
+    size:
+      inferContextWindowFromModel(
+        modelId,
+        modelInfo?.resolvedModel,
+        modelInfo?.displayName,
+        modelInfo?.description,
+      ) ?? DEFAULT_CONTEXT_WINDOW,
+    authoritative: false,
+  };
 }
 
 function parseModelConfig(
@@ -7915,6 +8536,12 @@ function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentMo
   }
 
   if (bestKey) {
-    return modelUsage[bestKey];
+    // `bestKey` is the SDK's resolved model id (e.g. "claude-sonnet-5[1m]"),
+    // the same spelling as ModelInfo.resolvedModel — the primary key the
+    // window is cached under. `currentModel` (the assistant message's
+    // `.model`) can be the bare form (e.g. "claude-sonnet-5"); the result
+    // handler caches under that spelling too, for seed-time reads that fall
+    // back to a bare id (rows without `resolvedModel`).
+    return { key: bestKey, usage: modelUsage[bestKey] };
   }
 }

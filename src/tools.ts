@@ -60,7 +60,6 @@ import {
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import path from "node:path";
-import { Logger } from "./acp-agent.js";
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -515,58 +514,43 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
  * matching rather than mangle the report.
  */
 function stripAgentTrailer(text: string): string {
-  // Matched by index rather than by tail-anchored regexes: an unanchored
-  // `…\s*$` pattern retries from every start position, so it costs O(n²) on
-  // text that repeats the trailer's opening token — and a subagent can echo
-  // exactly such text verbatim into its report. The index form is linear and
-  // keeps the same tail-anchored, independent semantics.
-  let out = text;
-
-  const beforeUsage = out.trimEnd();
-  if (beforeUsage.endsWith("</usage>")) {
-    // FIRST `<usage>`, not the last: the original pattern was unanchored, so
-    // it matched from the leftmost opener and its lazy body then stretched to
-    // the final `</usage>` to satisfy `$` — i.e. everything from the first
-    // opener onward is part of the stripped trailer.
-    const start = beforeUsage.indexOf("<usage>");
-    if (start !== -1) {
-      out = beforeUsage.slice(0, start);
-      if (out.endsWith("\n")) out = out.slice(0, -1);
-    }
-  }
-
-  // `agentId: <id> (…)`. The original `\n?` was optional, so the trailer did
-  // NOT have to start a line. Its match is nonetheless unique: `[^)]*` forbids
-  // `)` in the body, so the closing paren can only be the final character and
-  // the opener can only be the LAST `(` — which pins the whole match without
-  // scanning from every position.
-  const beforeAgentId = out.trimEnd();
-  if (beforeAgentId.endsWith(")")) {
-    const open = beforeAgentId.lastIndexOf("(");
-    const body = open === -1 ? null : beforeAgentId.slice(open + 1, beforeAgentId.length - 1);
-    // A `)` inside the body rules the trailer out (no earlier `(` can help:
-    // that stray `)` would still fall inside its body).
-    if (body !== null && !body.includes(")")) {
-      const head = beforeAgentId.slice(0, open);
-      if (head.endsWith(" ")) {
-        const beforeSpace = head.slice(0, -1);
-        const idStart = beforeSpace.lastIndexOf(" ") + 1;
-        const id = beforeSpace.slice(idStart);
-        if (AGENT_ID.test(id) && beforeSpace.slice(0, idStart).endsWith("agentId: ")) {
-          let start = idStart - "agentId: ".length;
-          if (start > 0 && beforeAgentId[start - 1] === "\n") start -= 1;
-          out = beforeAgentId.slice(0, start);
-        }
-      }
-    }
-  }
-
-  return out;
+  return stripAgentIdLine(stripUsageBlock(text));
 }
 
-/** The `<id>` of an `agentId:` trailer — tested only against an already
- *  isolated, space-delimited token, never scanned across the whole report. */
-const AGENT_ID = /^[\w-]+$/;
+const USAGE_OPEN = "<usage>";
+const USAGE_CLOSE = "</usage>";
+
+/** Remove a trailing `<usage>…</usage>` block, plus trailing whitespace and
+ *  one preceding newline. Matches from the *last* `<usage>` so a report that
+ *  merely mentions the marker earlier isn't truncated at the mention. */
+function stripUsageBlock(text: string): string {
+  const body = text.trimEnd();
+  if (!body.endsWith(USAGE_CLOSE)) {
+    return text;
+  }
+  const open = body.lastIndexOf(USAGE_OPEN, body.length - USAGE_CLOSE.length - USAGE_OPEN.length);
+  if (open === -1) {
+    return text;
+  }
+  return body.slice(0, open > 0 && body[open - 1] === "\n" ? open - 1 : open);
+}
+
+/** The continuation line, anchored to a whole line so the regex has a single
+ *  start position and no ambiguous repetition (`[\w-]+` can't consume the
+ *  following space, `[^)]*` can't consume the closing paren) — it runs in
+ *  linear time on any input. */
+const AGENT_ID_LINE = /^agentId: [\w-]+ \([^)]*\)$/;
+
+/** Remove a final `agentId: <id> (…)` line, plus trailing whitespace and the
+ *  newline that preceded the line. */
+function stripAgentIdLine(text: string): string {
+  const body = text.trimEnd();
+  const lineStart = body.lastIndexOf("\n") + 1;
+  if (!AGENT_ID_LINE.test(body.slice(lineStart))) {
+    return text;
+  }
+  return body.slice(0, Math.max(lineStart - 1, 0));
+}
 
 /** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
  *  string or block array), leaving non-text blocks untouched. */
@@ -702,7 +686,19 @@ export function toolUpdateFromToolResult(
 
     case "Bash": {
       const result = toolResult.content;
-      const terminalId = "tool_use_id" in toolResult ? String(toolResult.tool_use_id) : "";
+      // The terminal was announced under the tool_use's own id (see
+      // `toolInfoFromToolUse`), so key the output/exit metas off that: it is the
+      // id the client actually created a terminal for. `toolResult.tool_use_id`
+      // is the same value whenever present — the caller looks the tool_use up by
+      // it — so preferring `toolUse.id` only adds a source for the case where the
+      // result block carries no id at all. Anything that isn't a non-empty
+      // string is no id at all: `""` matches no terminal, and stringifying a
+      // present-but-undefined field would invent the literal `"undefined"`.
+      const terminalIdOf = (id: unknown): string | undefined =>
+        typeof id === "string" && id.length > 0 ? id : undefined;
+      const terminalId: string | undefined =
+        terminalIdOf(toolUse?.id) ??
+        terminalIdOf("tool_use_id" in toolResult ? toolResult.tool_use_id : undefined);
       const isError = "is_error" in toolResult && toolResult.is_error;
 
       // Extract output and exit code from either format:
@@ -783,7 +779,14 @@ export function toolUpdateFromToolResult(
         }
       }
 
-      if (supportsTerminalOutput) {
+      // Without a terminal id there is nothing the client can reconcile these
+      // metas against, and emitting them anyway strands the output: a client that
+      // buffers output/exit for terminals it has not been told about (Zed keeps
+      // them in `pending_terminal_output`/`pending_terminal_exit`, drained only on
+      // a matching create) would hold them forever behind an id that never
+      // arrives, showing an empty terminal. Fall through to the code-block
+      // rendering below instead.
+      if (supportsTerminalOutput && terminalId !== undefined) {
         return {
           content: [{ type: "terminal" as const, terminalId }],
           _meta: {
@@ -1232,12 +1235,7 @@ export const registerHookCallback = (
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
-  (
-    logger: Logger = console,
-    options?: {
-      onEnterPlanMode?: () => Promise<void>;
-    },
-  ): HookCallback =>
+  (options?: { onEnterPlanMode?: () => Promise<void> }): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
@@ -1249,11 +1247,8 @@ export const createPostToolUseHook =
         const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
         if (onPostToolUseHook) {
           await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
-          delete toolUseCallbacks[toolUseID]; // Cleanup after execution
-        } else {
-          logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
-          delete toolUseCallbacks[toolUseID];
         }
+        delete toolUseCallbacks[toolUseID]; // Cleanup after execution
       }
     }
     return { continue: true };
