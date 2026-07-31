@@ -39,8 +39,18 @@ import { toolUpdateFromToolResult } from "../tools.js";
  *     pattern's leading `\n` was optional, so the trailer did not have to start
  *     a line and `"mid-line agentId: a1 (x)"` was stripped to `"mid-line "`.
  *     Upstream tests `^agentId: [\w-]+ \([^)]*\)$` against the last whole line,
- *     so that input is now left untouched. Pinned by the third case below —
- *     which is what "nothing trailer-shaped ENDS it" is really asserting.
+ *     so that input is now left untouched. Pinned by the "does not START its
+ *     final line" case below — the one case here that actually DISCRIMINATES
+ *     the two implementations on this axis: its input is stripped by the
+ *     fork's parser and survives upstream's.
+ *
+ *     CORRECTION, 2026-07-31 (story 008 close-out). This paragraph previously
+ *     claimed divergence 2 was pinned by the "nothing trailer-shaped ENDS it"
+ *     case. It was not: that case's input contains no `agentId:` construct at
+ *     all, so BOTH parsers leave it untouched and it separates nothing. The
+ *     discriminating case was added rather than the claim softened — the
+ *     input/output pair it asserts is the same one carried in 2.2's issue
+ *     draft, so the suite and the report now state one story.
  *
  * Measured differential over 200 000 randomized trailer-shaped inputs: 2 874
  * (~1.4 %) produce different output between the two implementations, and every
@@ -105,6 +115,17 @@ describe("subagent trailer stripping — upstream semantics (R2.1, R2.3)", () =>
 
   it("(R2.3) leaves a report alone when nothing trailer-shaped ends it", () => {
     const text = "agentId mentioned mid-text (not a trailer) stays.\nDone.";
+
+    expect(strip(text)).toBe(text);
+  });
+
+  it("(R2.5) keeps an agentId: trailer that does not START its final line", () => {
+    // The second divergence, and the only case here that separates the two
+    // implementations on it. The fork's parser located the trailer from the
+    // last `(` and never required a line start, so it returned
+    // "Report.\nsee mid-line "; upstream tests a whole-line pattern against
+    // the final line, which this input fails, so the text survives intact.
+    const text = "Report.\nsee mid-line agentId: a1 (use SendMessage to continue)";
 
     expect(strip(text)).toBe(text);
   });
