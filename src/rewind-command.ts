@@ -214,8 +214,14 @@ export function formatCheckpointList(cps: Checkpoint[]): string {
 export function formatRewindResult(cp: Checkpoint, skippedLinks?: number): string {
   const confirmation = `Rewound files to checkpoint ${cp.index}: "${cp.excerpt}".`;
   // Type AND value are checked: the SDK field is optional, so `undefined` is
-  // the normal path, and testing `> 0` on a number also rejects NaN — nothing
-  // but a real positive count may reach the qualifier.
+  // the normal path, and testing `> 0` on a number also rejects NaN, which a
+  // `typeof` test alone would admit (`typeof NaN === "number"`).
+  //
+  // It does NOT reject every malformed number: `Infinity` and `0.5` pass this
+  // guard and would render as "Infinity files were" / "0.5 files were". The
+  // SDK returns an integer count, so those are UNREACHABLE rather than
+  // handled — stated plainly because a comment claiming a guarantee it does
+  // not deliver is the exact failure this function was changed to fix.
   if (typeof skippedLinks === "number" && skippedLinks > 0) {
     // Subject + verb agree with the count (R1.4): "1 file was", "2 files were".
     const refusal = skippedLinks === 1 ? "1 file was" : `${skippedLinks} files were`;

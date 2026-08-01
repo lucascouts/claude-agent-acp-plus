@@ -13,9 +13,10 @@ import type { Checkpoint } from "../rewind-command.js";
  * The module ignored it, so `Rewound files to checkpoint N: "…"` was emitted
  * unconditionally — a sentence that can be false.
  *
- * The suite is deliberately lopsided. Two cases state the new behavior; the
- * other six are UNCHANGED-BEHAVIOR guards that pass today and must keep passing.
- * That asymmetry is the point: the fix widens a variable's scope inside the one
+ * The suite is deliberately lopsided. Three cases state the new behavior (the
+ * plural clause, the singular clause, and the end-to-end path); the other six
+ * are UNCHANGED-BEHAVIOR guards that pass today and must keep passing. That
+ * asymmetry is the point: the fix widens a variable's scope inside the one
  * function that restores files, so the risk is not that the new clause is wrong
  * but that something around it moves.
  *
@@ -80,6 +81,12 @@ describe("formatRewindResult — refusal reporting (R1)", () => {
     expect(text.length).toBeGreaterThan(TODAY.length);
     expect(text).toContain("2");
     expect(text).toMatch(/files/);
+    // R1.1 has TWO clauses: state the count, and attribute it to link safety.
+    // Asserting only the count leaves the attribution free to be reworded into
+    // something false, so pin both -- and pin subject/verb agreement with it,
+    // which `toMatch(/files/)` alone would let regress to "2 files was".
+    expect(text).toMatch(/\b2 files were\b/);
+    expect(text).toMatch(/link safety/);
   });
 
   it("(R1.4) uses singular wording for exactly one refused file", () => {
@@ -88,6 +95,8 @@ describe("formatRewindResult — refusal reporting (R1)", () => {
     expect(text.startsWith(TODAY)).toBe(true);
     expect(text).toMatch(/\b1 file\b/);
     expect(text).not.toMatch(/\b1 files\b/);
+    expect(text).toMatch(/\b1 file was\b/);
+    expect(text).toMatch(/link safety/);
   });
 
   it("(R1.3) keeps the confirmation on a single line", () => {
@@ -120,6 +129,8 @@ describe("handleRewindCommand — the failure path stays untouched (R2)", () => 
     expect(text).toContain("Rewound files to checkpoint 1");
     expect(text).toContain("2");
     expect(text.length).toBeGreaterThan(TODAY.length);
+    expect(text).toMatch(/\b2 files were\b/);
+    expect(text).toMatch(/link safety/);
   });
 
   it("(R2.1) emits no confirmation when canRewind is false, even with refusals", async () => {
