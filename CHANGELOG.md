@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.4.0...v0.5.0) (2026-08-01)
+
+
+### Features
+
+* prune the fallback and sync upstream v0.64.0 (port from fork) ([f0b30f9](https://github.com/lucascouts/claude-agent-acp-plus/commit/f0b30f9d6f3c9c22aa41e874f9503e8b70309c43))
+
+
+### Bug Fixes
+
+* **deps:** pin brace-expansion to 5.0.8 to clear GHSA-mh99-v99m-4gvg ([38b8de3](https://github.com/lucascouts/claude-agent-acp-plus/commit/38b8de316799df5bb2358b73a8b7d99e493f39e1))
+* **rewind:** report link-safety refusals instead of claiming full success (port from fork) ([10ac37a](https://github.com/lucascouts/claude-agent-acp-plus/commit/10ac37ad2dd56bd13448e7753eec1c2bdc878dc6))
+
 ## [0.4.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.3.0...v0.4.0) (2026-07-19)
 
 
