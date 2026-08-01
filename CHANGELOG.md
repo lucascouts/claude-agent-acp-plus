@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.5.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.4.0...v0.5.0) (2026-08-01)
+
+
+### Features
+
+* prune the fallback and sync upstream v0.64.0 (port from fork) ([f0b30f9](https://github.com/lucascouts/claude-agent-acp-plus/commit/f0b30f9d6f3c9c22aa41e874f9503e8b70309c43))
+
+  **`ACP_ASKUSERQUESTION_FALLBACK` no longer exists.** The AskUserQuestion
+  permission fallback is gone entirely — the module, its two suites, and all
+  four wiring sites, which return to upstream's own wording. It was added when
+  Zed gated `elicitation.form` behind its acp-beta flag; Zed now advertises form
+  elicitation unconditionally, so the code was unreachable in the only client
+  that consumed it. Setting the variable has no effect, because nothing reads
+  it. A client that does **not** advertise form elicitation no longer sees the
+  AskUserQuestion tool at all — upstream's stance.
+
+  Upstream v0.64.0 closes a five-release gap (v0.59.0 → v0.64.0). The
+  user-visible win is upstream #894: session creation and model switching lose
+  a ~15 s stall.
+
+
+### Bug Fixes
+
+* **deps:** pin brace-expansion to 5.0.8 to clear GHSA-mh99-v99m-4gvg ([38b8de3](https://github.com/lucascouts/claude-agent-acp-plus/commit/38b8de316799df5bb2358b73a8b7d99e493f39e1))
+* **rewind:** report link-safety refusals instead of claiming full success (port from fork) ([10ac37a](https://github.com/lucascouts/claude-agent-acp-plus/commit/10ac37ad2dd56bd13448e7753eec1c2bdc878dc6))
+
+  SDK 0.3.220 added `RewindFilesResult.skippedLinks`, a count of tracked files
+  the SDK did **not** restore — a symlink, hard link or other non-regular file
+  sits at the tracked path, the parent directory no longer resolves where it
+  pointed, or the backup could not be safely read. The adapter ignored it, so
+  `/rewind <n>` reported the same unqualified success whether every file was
+  restored or half of them were silently refused. It now says so: `1 file was` /
+  `N files were left unchanged for link safety.` A rewind that refused nothing
+  is byte-identical to before.
+
+
+### Security
+
+* the project's own ReDoS fix is reverted, superseded upstream ([f0b30f9](https://github.com/lucascouts/claude-agent-acp-plus/commit/f0b30f9d6f3c9c22aa41e874f9503e8b70309c43))
+
+  The polynomial-ReDoS rewrite shipped in 0.4.0 (CWE-1333, in subagent trailer
+  stripping) is removed in favour of upstream's own fix in v0.60.0
+  (agentclientprotocol/claude-agent-acp#879); our report, issue #893, is closed.
+  The vulnerability remains fixed — the implementation is now upstream's rather
+  than ours, which is what keeps `src/tools.ts` byte-identical to upstream and
+  out of every future sync's conflict set.
+
+  **Two observable behaviours change, both conservative — upstream truncates
+  less:**
+
+  - `<usage>` stripping now anchors on the **last** opening marker rather than
+    the first. A report that merely quotes `<usage>` earlier in its text keeps
+    that quote, instead of having everything from it onward removed.
+  - The `agentId:` trailer must now occupy a **whole final line** to be
+    stripped. A report mentioning `agentId:` mid-line keeps that text, where the
+    previous implementation located the trailer from the last `(` and truncated
+    there.
+
+  A fork-owned test suite pins both divergences so a future sync cannot silently
+  reintroduce the old semantics.
+
 ## [0.4.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.3.0...v0.4.0) (2026-07-19)
 
 
