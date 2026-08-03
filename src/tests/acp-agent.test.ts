@@ -33,6 +33,7 @@ import {
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
+  describeAlwaysAllow,
   claudeCliPath,
   streamEventToAcpNotifications,
   messageIdForGrouping,
@@ -1999,6 +2000,81 @@ describe("permission requests", () => {
       expect(Array.isArray(requestStructure.toolCall.content)).toBe(true);
     }
   });
+
+  describe("describeAlwaysAllow", () => {
+    it("falls back to naming the whole tool when no suggestions are provided", () => {
+      expect(describeAlwaysAllow(undefined, "Bash")).toBe("Always Allow all Bash");
+      expect(describeAlwaysAllow([], "Read")).toBe("Always Allow all Read");
+    });
+
+    it("includes the scoped rule content from a suggestion", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(npm test:*)");
+    });
+
+    it("indicates a tool-wide rule when the suggestion has no ruleContent", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Read" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Read",
+      );
+      expect(label).toBe("Always Allow all Read");
+    });
+
+    it("joins multiple rules and directory suggestions", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [
+              { toolName: "Bash", ruleContent: "git status" },
+              { toolName: "Bash", ruleContent: "git diff:*" },
+            ],
+            behavior: "allow",
+            destination: "session",
+          },
+          {
+            type: "addDirectories",
+            directories: ["/tmp/work"],
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(git status), Bash(git diff:*) and access to /tmp/work");
+    });
+
+    it("ignores non-allow rules and falls back when nothing is left", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "rm -rf:*" }],
+            behavior: "deny",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow all Bash");
+    });
+  });
 });
 
 describe("permission request cancellation", () => {
@@ -2121,7 +2197,12 @@ describe("permission request cancellation", () => {
       { kind: "allow_once", name: "Allow Once", optionId: "allow" },
       {
         kind: "allow_always",
-        name: "Always Allow",
+        // Deliberate fork divergence: upstream #930 fixes this label at
+        // "Always Allow" and moves the scope into `_meta.permission`. No
+        // shipping client renders that metadata yet, so the fork keeps the
+        // scope in the label too — `describeAlwaysAllow` with no suggestions
+        // names the whole tool rather than leaving a blank cheque.
+        name: "Always Allow all Bash",
         optionId: "allow_always",
         _meta: {
           permission: {

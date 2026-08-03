@@ -1244,6 +1244,58 @@ export function resolvePermissionMode(
   return mapped;
 }
 
+/**
+ * Builds the label for the "Always Allow" permission option so the user can see
+ * the exact scope they are committing to. Uses the SDK-provided suggestions
+ * when available (e.g. `Bash(npm test:*)`) and falls back to naming the whole
+ * tool so "Always Allow" is never a blank check without disclosure.
+ *
+ * Fork-only layer. Upstream #930 moved the scope disclosure out of the option
+ * label and into `_meta.permission.changes`, leaving the label as a fixed
+ * "Always Allow". No shipping client reads that metadata yet — Zed in
+ * particular has no reference to it — so on the label alone the user would be
+ * granting a rule they cannot see. This restores the disclosure in the label
+ * WITHOUT dropping the upstream metadata: both travel on the same option, and
+ * the label can be retired once a client renders the structured form.
+ */
+export function describeAlwaysAllow(
+  suggestions: PermissionUpdate[] | undefined,
+  toolName: string,
+): string {
+  if (!suggestions || suggestions.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  const ruleLabels: string[] = [];
+  const directories: string[] = [];
+
+  for (const update of suggestions) {
+    if (update.type === "addRules" && update.behavior === "allow") {
+      for (const rule of update.rules) {
+        ruleLabels.push(
+          rule.ruleContent ? `${rule.toolName}(${rule.ruleContent})` : `all ${rule.toolName}`,
+        );
+      }
+    } else if (update.type === "addDirectories") {
+      directories.push(...update.directories);
+    }
+  }
+
+  const parts: string[] = [];
+  if (ruleLabels.length > 0) {
+    parts.push(ruleLabels.join(", "));
+  }
+  if (directories.length > 0) {
+    parts.push(`access to ${directories.join(", ")}`);
+  }
+
+  if (parts.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  return `Always Allow ${parts.join(" and ")}`;
+}
+
 function permissionLifetime(destination: PermissionUpdate["destination"]): Record<string, string> {
   switch (destination) {
     case "session":
@@ -4998,8 +5050,11 @@ export class ClaudeAcpAgent {
             { kind: "reject_once", name: "Deny", optionId: "reject" },
             { kind: "allow_once", name: "Allow Once", optionId: "allow" },
             {
+              // The label discloses the scope for clients that render only the
+              // option name; `_meta.permission` carries the same commitment in
+              // the structured upstream form. See `describeAlwaysAllow`.
               kind: "allow_always",
-              name: "Always Allow",
+              name: describeAlwaysAllow(suggestions, toolName),
               optionId: "allow_always",
               _meta: {
                 permission: permissionMetadataForAlwaysAllow(suggestions, toolName),
