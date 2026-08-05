@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.0...v0.5.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **deps:** resolve 7 advisories via security overrides ([#40](https://github.com/lucascouts/claude-agent-acp-plus/issues/40)) ([c7cb7a7](https://github.com/lucascouts/claude-agent-acp-plus/commit/c7cb7a73c50795cdb21d209d08c3663db0dbed3a))
+
 ## [0.5.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.4.0...v0.5.0) (2026-08-01)
 
 
