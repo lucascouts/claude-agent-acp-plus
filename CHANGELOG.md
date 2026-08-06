@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.1...v0.5.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* **permissions:** keep the Always Allow scope visible in the option label ([e931b06](https://github.com/lucascouts/claude-agent-acp-plus/commit/e931b06d58b60d39d2f5d2bdabc4672473870a41))
+
 ## [0.5.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.0...v0.5.1) (2026-08-05)
 
 
