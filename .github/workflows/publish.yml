@@ -20,7 +20,11 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         id: release
         with:
-          release-type: node
+          # Do not add release-type here. The action ignores config-file whenever
+          # release-type is set, which silently disables the pre-1.0 versioning
+          # rules in release-please-config.json and lets a breaking change jump
+          # straight to 1.0.0. The node release type is declared in that config
+          # instead, so nothing is lost by leaving this out.
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
     outputs:
