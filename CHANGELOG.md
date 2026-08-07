@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.2...v0.6.0) (2026-08-07)
+
+
+### Features
+
+* port upstream v0.65.0 — provider-neutral ACP goal extension ([0f4fd18](https://github.com/lucascouts/claude-agent-acp-plus/commit/0f4fd181579edf06d383df0b008e4ba7faf76682))
+
 ## [0.5.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.1...v0.5.2) (2026-08-06)
 
 
