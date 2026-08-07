@@ -91,6 +91,8 @@ import {
   GoalCapability,
   GoalRequest,
   GoalControlResponse,
+  GoalSnapshot,
+  goalUpdateFromPrompt,
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
@@ -425,6 +427,20 @@ type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
+  /** Optimistic goal state published for a submitted `/goal` command whose
+   *  matching runtime update has not arrived yet. Runtime updates for the old
+   *  goal are suppressed until this command is echoed or completes, otherwise
+   *  a late old-goal update can overwrite a replacement that the runtime never
+   *  announces (the compatibility case the optimistic update exists for). */
+  pendingGoalUpdate?: {
+    commandUuid: string;
+    expected: GoalSnapshot | null;
+    previous: GoalSnapshot | null | undefined;
+    started: boolean;
+  };
+  /** Last goal snapshot sent to the ACP client, used to roll back an
+   *  optimistic `/goal` update when the command itself fails. */
+  lastPublishedGoal?: GoalSnapshot | null;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -2107,15 +2123,72 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
+    await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
     return response;
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
-    await this.prompt({
+    const command = params.action === "set" ? `/goal ${params.objective}` : "/goal clear";
+    const prompt = [{ type: "text" as const, text: command }];
+    const steering = await this.steer({
       sessionId: params.sessionId,
-      prompt: [{ type: "text", text: "/goal clear" }],
+      prompt,
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     });
+    if (steering.outcome === "promptRequired") {
+      await this.prompt({ sessionId: params.sessionId, prompt });
+    }
     return {};
+  }
+
+  private async publishGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (session) {
+      session.lastPublishedGoal = goal;
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { goal },
+      },
+    });
+  }
+
+  private async publishGoalFromPrompt(
+    sessionId: string,
+    prompt: string,
+    commandUuid: string,
+  ): Promise<void> {
+    const goalUpdate = goalUpdateFromPrompt(prompt);
+    if (goalUpdate !== undefined) {
+      const session = this.sessions[sessionId];
+      if (session) {
+        session.pendingGoalUpdate = {
+          commandUuid,
+          expected: goalUpdate,
+          previous: session.lastPublishedGoal,
+          started: false,
+        };
+      }
+      await this.publishGoal(sessionId, goalUpdate);
+    }
+  }
+
+  private async publishRuntimeGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    const pending = session?.pendingGoalUpdate;
+    if (pending) {
+      const matchesPending =
+        pending.expected === null
+          ? goal === null
+          : goal !== null && goal.objective === pending.expected.objective;
+      if (!matchesPending) {
+        return;
+      }
+      session.pendingGoalUpdate = undefined;
+    }
+    await this.publishGoal(sessionId, goal);
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -2201,6 +2274,8 @@ export class ClaudeAcpAgent {
       turnInFlight.deferredSettle = undefined;
     }
     session.input.push(userMessage);
+    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
   }
 
@@ -2890,13 +2965,7 @@ export class ClaudeAcpAgent {
         // exhaustive switch and publish only the provider-neutral ACP shape.
         if ((message as { type: string }).type === "active_goal") {
           const activeGoal = message as unknown as SDKActiveGoalMessage;
-          await this.client.sessionUpdate({
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "session_info_update",
-              _meta: { goal: toGoalSnapshot(activeGoal) },
-            },
-          });
+          await this.publishRuntimeGoal(params.sessionId, toGoalSnapshot(activeGoal));
           continue;
         }
 
@@ -3496,6 +3565,21 @@ export class ClaudeAcpAgent {
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
                 ensureActiveTurn();
+                // Once the submitted goal command has produced its own result,
+                // no older runtime update can still precede it in the ordered
+                // SDK stream. Stop suppressing updates even when this runtime
+                // omitted the matching active_goal notification entirely.
+                if (session.pendingGoalUpdate?.started) {
+                  const pendingGoalUpdate = session.pendingGoalUpdate;
+                  session.pendingGoalUpdate = undefined;
+                  const goalCommandFailed =
+                    message.is_error ||
+                    message.stop_reason === "refusal" ||
+                    ("result" in message && message.result.includes("Please run /login"));
+                  if (goalCommandFailed) {
+                    await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
+                  }
+                }
               }
 
               // A result closes the stretch of output it terminates: snapshot
@@ -3691,6 +3775,20 @@ export class ClaudeAcpAgent {
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
                 settleOrDefer({ stopReason: "refusal", usage: sessionUsage(session) });
+                break;
+              }
+
+              // A priority:'now' steer can make the SDK terminate the
+              // interrupted cycle with an error-shaped diagnostic result
+              // before it replays the injected message's echo. That result is
+              // not the steered command's outcome: keep it on the steer lane
+              // and let the cycle after the pending echo decide the turn.
+              if (
+                message.is_error &&
+                isSteering(session.activeTurn) &&
+                session.activeTurn.steeredEchoes.size > 0
+              ) {
+                settleOrDefer({ stopReason: "end_turn", usage: sessionUsage(session) });
                 break;
               }
 
@@ -3966,6 +4064,9 @@ export class ClaudeAcpAgent {
             // is still promoted — activateTurn() clears the flag. The turn's own
             // echo is then dropped from the feed (the client already shows it).
             if (message.type === "user" && "uuid" in message && message.uuid) {
+              if (session.pendingGoalUpdate?.commandUuid === message.uuid) {
+                session.pendingGoalUpdate.started = true;
+              }
               const queued = findUnsettledTurn(message.uuid);
               if (queued) {
                 // Only (re)activate if this isn't already the active turn — a
@@ -4417,6 +4518,14 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // A priority steer may still be queued in the SDK when cancellation
+    // settles its owning turn. Its later echo matches no live turn, and its
+    // result must be skipped rather than promoted onto the next prompt.
+    if (isSteering(session.activeTurn)) {
+      for (const uuid of session.activeTurn.steeredEchoes) {
+        this.trackOrphanCommand(session, uuid, "pending");
+      }
+    }
     // Capture the orphan-accounting lane before anything can await: the
     // consumer latches msgLifecycleV1 when it drains the first system/init,
     // which can happen DURING the awaited interrupt() below — the receipt
