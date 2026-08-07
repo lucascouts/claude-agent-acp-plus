@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.6.0...v0.7.0) (2026-08-07)
+
+
+### Features
+
+* port upstream v0.66.0 — reliable goal publication with the set action ([#48](https://github.com/lucascouts/claude-agent-acp-plus/issues/48)) ([9e87cd2](https://github.com/lucascouts/claude-agent-acp-plus/commit/9e87cd297988a6ca1429277de9390fee500157de))
+
 ## [0.6.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.5.2...v0.6.0) (2026-08-07)
 
 
