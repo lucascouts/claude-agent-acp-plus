@@ -55,6 +55,15 @@ failing_steps() {
 # broad enough to catch an unrelated step would turn a real defect into
 # something waivable, which is the one failure mode this classification exists
 # to prevent. Anything unmatched is a genuine failure.
+#
+# The list below is calibrated against a real run, not against expectation. The
+# first two entries were predicted before anything ran; when the four jobs were
+# actually executed against release PR #50, both predictions turned out to be
+# wrong — harden-runner detects a non-GitHub runner and degrades to a no-op
+# rather than failing, and setup-node reports "npm cache is not found" and
+# carries on. They stay because degrading gracefully today is not a promise to
+# keep doing so. The last three are what genuinely failed, each identified by
+# the error it printed rather than by a guess.
 environmental_reason() {
   case $1 in
   *harden-runner* | *"Harden the runner"* | *"Harden Runner"*)
@@ -62,6 +71,21 @@ environmental_reason() {
     ;;
   *setup-node* | *"Use Node.js"* | *"Setup Node.js"*)
     printf '%s' 'actions/setup-node with cache: "npm" reads and writes the GitHub-hosted cache service, which act does not provide'
+    ;;
+  *"Upload artifact"*)
+    # Measured: "::error::Unable to get the ACTIONS_RUNTIME_TOKEN env variable".
+    printf '%s' "uploading an artifact needs ACTIONS_RUNTIME_TOKEN, which only a GitHub-hosted runner is issued"
+    ;;
+  *"Upload to code-scanning"*)
+    # Measured: "::error::Not Found - .../rest/actions/workflow-runs".
+    printf '%s' "the code-scanning API attaches a SARIF result to a workflow run, and a local run has no run to attach it to"
+    ;;
+  *"Error troubleshooter"*)
+    # A diagnostic step osv-scanner-reusable runs only after an earlier step
+    # failed. It is a consequence, never a cause — and it cannot launder a real
+    # defect through, because the step that actually broke is in the same list
+    # and would not match anything here, which makes the whole job a failure.
+    printf '%s' "osv-scanner's diagnostic step, reached only because an upload above it could not run locally"
     ;;
   *) return 1 ;;
   esac
@@ -216,11 +240,20 @@ trap 'rm -rf "$scratch"' EXIT
 # an event carrying a base ref — without one the jobs are filtered out before a
 # step runs, and an empty run would look like a pass. The default branch comes
 # off the remote when git knows it.
+#
+# `repository` is here because an action reads it. GitHub's own event payload
+# always carries it, and gitleaks-action dereferences
+# `eventJSON.repository.owner.login` unguarded: with the key absent it died on
+# "Cannot read properties of undefined (reading 'owner')" — a crash produced by
+# this payload rather than by anything under test, which would have been
+# published as a failing secret scan. Synthesising a payload means owing it the
+# fields the real one has.
 base_ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || base_ref=""
 base_ref=${base_ref#origin/}
 [ -n "$base_ref" ] || base_ref=main
-printf '{"number":%s,"pull_request":{"number":%s,"head":{"sha":"%s"},"base":{"ref":"%s"}}}\n' \
-  "$pr_number" "$pr_number" "$head_sha" "$base_ref" >"$scratch/event.json"
+printf '{"number":%s,"pull_request":{"number":%s,"head":{"sha":"%s"},"base":{"ref":"%s"}},"repository":{"name":"%s","full_name":"%s","owner":{"login":"%s","name":"%s"},"default_branch":"%s"}}\n' \
+  "$pr_number" "$pr_number" "$head_sha" "$base_ref" \
+  "${repo#*/}" "$repo" "${repo%%/*}" "${repo%%/*}" "$base_ref" >"$scratch/event.json"
 
 # R1.6 says the checkout must come out as it went in. `npm ci` runs inside the
 # container and act copies the workspace rather than mounting it — only
