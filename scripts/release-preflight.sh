@@ -107,12 +107,89 @@ if gh release view "v$title_version" --repo "$repo" >/dev/null 2>&1; then
 fi
 pass "tag v$title_version does not exist yet"
 
-build=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq '
-  [.statusCheckRollup[]? | select(.name == "Build")]
-  | if length == 0 then "MISSING" else (.[0].conclusion // .[0].status // "PENDING") end')
-[ "$build" = "SUCCESS" ] ||
-  fail "required check 'Build' is $build on #$pr_number, expected SUCCESS."
-pass "required check 'Build' passed"
+# ── The four checks a release PR never gets ─────────────────────────────────
+#
+# The `name:` of each job GitHub would have run, which is also the context
+# scripts/ci-attest.sh publishes each status under. Written once, here, and
+# interpolated into the query below rather than re-typed into it: GitHub keys a
+# check by that string, so one character of drift makes the guard look for
+# something that does not exist — and nothing anywhere errors when it does.
+REQUIRED_CHECKS=(
+  "Build"
+  "Secret scan (gitleaks)"
+  "Dependency scan (OSV-Scanner)"
+  "npm audit"
+)
+
+# gh's jq engine takes no --arg, so the names have to travel inside the program
+# text itself. Quote them into a jq array literal: a name carrying a quote or a
+# backslash would otherwise close the string early and leave a program that does
+# not parse.
+jq_string_array() {
+  local out="" item
+  for item in "$@"; do
+    item=${item//\\/\\\\}
+    item=${item//\"/\\\"}
+    out="$out,\"$item\""
+  done
+  printf '[%s]' "${out#,}"
+}
+required_json=$(jq_string_array "${REQUIRED_CHECKS[@]}")
+
+# A rollup mixes two shapes, and reading only one of them was the defect this
+# replaces. A check run — what a workflow produces — carries .name and
+# .conclusion; a commit status — what ci-attest.sh publishes — carries .context
+# and .state. Matching on .name alone made every published attestation invisible,
+# so the guard waved through a PR whose checks it had never actually seen, and
+# it examined only one of the four at that.
+#
+# Only the rollup is consulted, and deliberately so: it reports the checks on the
+# pull request's *current* head, and release-please moves that head every time it
+# rewrites the PR. Asking for the statuses of a SHA named anywhere else would let
+# an attestation made against a superseded commit satisfy the guard (R3.6).
+#
+# The query answers with one line per check that is missing or not successful,
+# and with nothing at all when all four passed — so a single run tells the whole
+# story instead of stopping at the first problem. A check outside the four is
+# never consulted: CodeQL runs on these PRs through GitHub's default
+# code-scanning setup and can fail for reasons this guard does not own.
+#
+# Read it downwards: take the rollup, walk the four required names, find the
+# entry for each, work out its state, and keep only the ones that are not a
+# success. $rollup, $want, $entry and $got are jq's variables, not the shell's,
+# and the single quotes are what keeps them out of the shell's hands; only
+# $required_json is meant to expand, and it does so from outside those quotes.
+# shellcheck disable=SC2016
+not_passing=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq '
+  def outcome: (.conclusion // .state // .status // "PENDING") | tostring | ascii_upcase;
+  (.statusCheckRollup // []) as $rollup
+  | '"$required_json"'[]
+  | . as $want
+  | ($rollup | map(select((.name // .context) == $want)) | first) as $entry
+  | (if $entry == null then "MISSING" else ($entry | outcome) end) as $got
+  | select($got != "SUCCESS")
+  | "\($want) is \($got)"')
+
+if [ -n "$not_passing" ]; then
+  # Indent every line into the refusal. `IFS= read -r` keeps the line intact:
+  # unlike a tab-separated read, it cannot fold or trim anything away.
+  detail=""
+  while IFS= read -r problem; do
+    [ -n "$problem" ] || continue
+    detail="$detail
+      $problem"
+  done <<<"$not_passing"
+  fail "required checks are not passing on #$pr_number:$detail
+      pull_request workflows do not run on a release PR, so a check is absent
+      rather than red. Run those jobs here and publish the outcome onto the PR
+      head:
+
+        npm run release:attest        (scripts/ci-attest.sh)
+
+      See docs/RELEASES.md."
+fi
+joined=$(printf '%s, ' "${REQUIRED_CHECKS[@]}")
+pass "required checks passed: ${joined%, }"
 
 cat <<EOF
 

@@ -35,11 +35,13 @@
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run format:check",
     "release:preflight": "bash scripts/release-preflight.sh",
+    "release:attest": "bash scripts/ci-attest.sh",
     "ci:local": "npm run format:check && npm run lint && npm run build && npm run test:run",
     "test": "vitest",
     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:shell": "bats scripts/tests",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
