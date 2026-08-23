@@ -39,8 +39,8 @@ setup() {
   write_act_stub
   write_runtime_stubs
 
-  fixtures_open_release_pr
   make_repo
+  fixtures_open_release_pr
 }
 
 # Test double for the GitHub CLI: records the call — including a payload passed
@@ -201,6 +201,11 @@ YML
   git -C "$WORK" remote add origin https://github.com/acme/widget.git
   git -C "$WORK" add -A
   git -C "$WORK" -c user.email=test@example.com -c user.name=test commit -qm "fixture"
+  # The head of a release PR is a commit that exists. Deriving HEAD_SHA from the
+  # fixture rather than inventing one keeps that true here too, which is what lets
+  # the script require the object locally before it attests anything against it.
+  HEAD_SHA=$(git -C "$WORK" rev-parse HEAD)
+  export HEAD_SHA
   return 0
 }
 
@@ -261,4 +266,21 @@ status_for() {
   run attest
   [ "$status" -eq 0 ]
   grep -q "$HEAD_SHA" "$GH_LOG"
+}
+
+@test "refuses to attest a head commit this checkout does not have" {
+  require_script
+
+  # gitleaks resolves its scan range from the PR head, as `<sha>^..<sha>`. With
+  # the object absent that range does not resolve: gitleaks scans zero bytes and
+  # still reports "no leaks found", so a secret scan that read nothing can be
+  # published green. The fixture's remote is not reachable, so the object cannot
+  # be fetched either — the run has to stop instead of attesting over nothing.
+  local absent=2222222222222222222222222222222222222222
+  printf '%s\n' "[{\"number\":77,\"title\":\"chore(main): release 0.8.0\",\"headRefName\":\"release-please--branches--main\",\"headRefOid\":\"$absent\",\"labels\":[{\"name\":\"autorelease: pending\"}]}]" >"$FIX/pr-list.json"
+
+  run attest
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"${absent:0:7}"* ]]
+  [ -z "$(published_statuses)" ]
 }

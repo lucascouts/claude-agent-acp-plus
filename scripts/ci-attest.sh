@@ -175,6 +175,39 @@ case $head_sha in
 esac
 pass "release PR #$pr_number at ${head_sha:0:7} ($pr_title)"
 
+# The head commit has to be in this checkout before any job runs, because one of
+# the jobs reads history rather than files: gitleaks derives its scan range from
+# this SHA as `<sha>^..<sha>`. With the object missing that range does not
+# resolve, and gitleaks does not treat it as fatal — it scans zero bytes and
+# still prints "no leaks found". Published, that is a green secret scan over a
+# scan that read nothing, which is worse than a red one: a red gets looked at.
+#
+# Release PR branches live on the remote and are rarely fetched locally, so this
+# is the normal case rather than the exceptional one. The pull ref is used
+# because GitHub always serves it, whereas fetching a bare SHA depends on the
+# server allowing reachable-SHA1-in-want. Fetching writes objects into .git and
+# leaves the working tree alone, which is what R1.6 is about; the fingerprint
+# below still measures that rather than trusting it.
+#
+# The result is verified rather than inferred from the exit status: a fetch that
+# reported success but left the object absent would be the same defect wearing a
+# different face.
+if ! git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+  git fetch --quiet origin "refs/pull/$pr_number/head" 2>/dev/null ||
+    git fetch --quiet origin "$head_sha" 2>/dev/null ||
+    true
+fi
+git cat-file -e "$head_sha^{commit}" 2>/dev/null ||
+  fail "the release PR's head commit ${head_sha:0:7} is not in this checkout, and
+      fetching it from 'origin' did not bring it in.
+      The jobs would then run against a commit range that does not resolve:
+      gitleaks scans zero bytes, reports 'no leaks found', and that would be
+      published as a green secret scan over nothing scanned. Bring the commit in
+      and run this again:
+        git fetch origin refs/pull/$pr_number/head
+      Nothing was published."
+pass "head commit ${head_sha:0:7} is in this checkout"
+
 # Probe the runtime instead of trusting that the binary exists: a stopped daemon
 # looks exactly like a working one until a job is already running, and it fails
 # then. Either runtime will do — act drives both.
