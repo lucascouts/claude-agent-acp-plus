@@ -47,3 +47,24 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+      # One integration test, not the suite. The adapter hardcodes the SDK's
+      # built-in agent roster in BUILTIN_AGENT_NAMES, because AgentInfo carries
+      # no built-in/custom flag; when the SDK changes that roster the set drifts
+      # silently, and a newly added built-in leaks into the ACP agent picker as
+      # if the user had configured it. This test drives the real SDK and is the
+      # only thing that notices.
+      #
+      # It had been failing unseen: the whole integration suite is gated behind
+      # RUN_INTEGRATION_TESTS, which no job set, so `claude-code-guide` stayed
+      # in the set long after the SDK dropped it and no pull request ever went
+      # red. Running it here is what closes that hole.
+      #
+      # The rest of the suite deliberately stays out. Those tests open real
+      # sessions — /compact, /rewind, a thinking toggle across a model switch —
+      # and need Anthropic credentials the runner does not have and should not
+      # be given for a pull request. Measured through act: this file passes in a
+      # bare container in ~0.4s, while the session-driven files fail there for
+      # want of auth. A green that needs a secret is not a green worth adding.
+      - name: Check the SDK's built-in agent roster
+        run: RUN_INTEGRATION_TESTS=true npx vitest run src/tests/agent-discovery.test.ts
