@@ -283,3 +283,22 @@ status_for() {
   [[ "$output" == *"Build"* || "$output" == *"build"* ]]
   [[ "$output" == *"npm run test:run"* ]]
 }
+
+@test "switches off gitleaks' artifact upload, and only for that job" {
+  require_script
+
+  run attest
+  [ "$status" -eq 0 ]
+
+  # What is switched off is the runner-side publication of results.sarif, not the
+  # scan. gitleaks-action passes process.env.HOME as the artifact's root
+  # directory; on a GitHub runner HOME contains the workspace, in a container it
+  # is /root and does not, so the upload throws after a scan that already
+  # succeeded. The scan still runs over the full range, and a leak still fails
+  # the step — the action propagates gitleaks' exit code after the upload block
+  # rather than through it, so nothing here can hide one.
+  grep -- '--job gitleaks' "$ACT_LOG" | grep -q -- 'GITLEAKS_ENABLE_UPLOAD_ARTIFACT=false'
+
+  # The variable belongs to one action, so no other job is handed it.
+  ! grep -v -- '--job gitleaks' "$ACT_LOG" | grep -q -- 'GITLEAKS_ENABLE_UPLOAD_ARTIFACT'
+}

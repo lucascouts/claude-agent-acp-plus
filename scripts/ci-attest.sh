@@ -245,11 +245,26 @@ cd "$repo_root" || fail "cannot enter the repository root '$repo_root'."
 # status is published under. Fields are separated by '|' rather than a tab
 # because '|' is not IFS whitespace: `read` cannot fold two separators into one
 # and shift the fields silently, the way it would with tabs.
+# A fourth field carries an environment variable the local runner needs and the
+# GitHub one does not. It is deliberately per-job: a variable handed to every job
+# would eventually reach one whose behaviour it changes.
+#
+# gitleaks is the only entry that needs one. gitleaks-action passes
+# `process.env.HOME` as the root directory of the results.sarif artifact; on a
+# GitHub runner HOME contains the workspace, in a container it is /root and does
+# not, so the upload throws after a scan that already finished. Switching the
+# upload off keeps the scan — the thing being attested — running over the full
+# range, and cannot hide a leak: the action propagates gitleaks' exit code after
+# the upload block, not through it, so a detection still exits the step non-zero.
+#
+# Note what is NOT done here: no variable is passed that the software under test
+# reads. That distinction is the whole line between reproducing a job and
+# rigging it.
 JOBS=(
-  "build|.github/workflows/ci.yml|Build"
-  "gitleaks|.github/workflows/security.yml|Secret scan (gitleaks)"
-  "osv-scan|.github/workflows/security.yml|Dependency scan (OSV-Scanner)"
-  "npm-audit|.github/workflows/security.yml|npm audit"
+  "build|.github/workflows/ci.yml|Build|"
+  "gitleaks|.github/workflows/security.yml|Secret scan (gitleaks)|GITLEAKS_ENABLE_UPLOAD_ARTIFACT=false"
+  "osv-scan|.github/workflows/security.yml|Dependency scan (OSV-Scanner)|"
+  "npm-audit|.github/workflows/security.yml|npm audit|"
 )
 
 # Refuse before starting a single container when a workflow file is not here:
@@ -257,7 +272,7 @@ JOBS=(
 # read as the whole story.
 unattestable=""
 for row in "${JOBS[@]}"; do
-  IFS='|' read -r job_id workflow check_name <<<"$row"
+  IFS='|' read -r job_id workflow check_name job_env <<<"$row"
   [ -f "$workflow" ] || unattestable="$unattestable
       $check_name — $workflow is not in this repository"
 done
@@ -312,7 +327,7 @@ unreproduced=()
 exit_code=0
 
 for row in "${JOBS[@]}"; do
-  IFS='|' read -r job_id workflow check_name <<<"$row"
+  IFS='|' read -r job_id workflow check_name job_env <<<"$row"
   checks+=("$check_name")
   log="$scratch/$job_id.log"
   printf '\n----- %s (job %s of %s) -----\n' "$check_name" "$job_id" "$workflow"
@@ -321,9 +336,14 @@ for row in "${JOBS[@]}"; do
   # something other than what GitHub runs. Output is teed so a run of several
   # minutes is not silent, and kept so the failing step can be read back.
   rc=0
+  # Expanded through a guard rather than unquoted: with `set -u` an empty array
+  # is an error on its own, and the three jobs without an env entry have one.
+  act_env=()
+  [ -z "$job_env" ] || act_env=(--env "$job_env")
   act pull_request \
     --workflows "$workflow" \
     --job "$job_id" \
+    ${act_env[@]+"${act_env[@]}"} \
     --eventpath "$scratch/event.json" 2>&1 | tee "$log" || rc=$?
 
   if [ "$rc" -eq 0 ]; then
