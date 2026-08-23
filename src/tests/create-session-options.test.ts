@@ -795,7 +795,19 @@ describe("createSession options merging", () => {
       return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
     }
 
-    const signal = () => ({ signal: new AbortController().signal });
+    // `requestId` is part of the options the SDK hands OnUserDialog and
+    // OnElicitation: it carries the control_request envelope's id, which a
+    // response sent out-of-band has to echo. It became a required field of
+    // both callback types in claude-agent-sdk 0.3.232.
+    //
+    // Supplying it from a helper rather than at each call site keeps this
+    // compiling against both SDKs: TypeScript only rejects surplus properties
+    // on an object literal passed directly, so the older signature — which has
+    // no `requestId` — accepts this return value unchanged.
+    const signal = () => ({
+      signal: new AbortController().signal,
+      requestId: "test-control-request-id",
+    });
 
     it("renders the prompt as a form elicitation and maps the retry choice", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
