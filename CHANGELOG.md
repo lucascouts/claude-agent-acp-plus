@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.7.0...v0.8.0) (2026-08-23)
+
+
+### Features
+
+* **ci:** attest release-PR checks locally with act and commit statuses ([12a2fa8](https://github.com/lucascouts/claude-agent-acp-plus/commit/12a2fa861154a4789394c9a08ce1553c3ca24413))
+
+
+### Bug Fixes
+
+* **ci:** attest gitleaks by running its scan, not by waiving its job ([65f8079](https://github.com/lucascouts/claude-agent-acp-plus/commit/65f8079fca985b80c5a62ed57292bedacbe0f7bf))
+* **ci:** calibrate the environmental gaps against a real act run ([e47b149](https://github.com/lucascouts/claude-agent-acp-plus/commit/e47b1496e617417ec31daae906bfa39822743176))
+* **ci:** require the PR head commit before attesting anything ([957a582](https://github.com/lucascouts/claude-agent-acp-plus/commit/957a582fce9a5bf6838f5ff9fc683f35d2548875))
+
 ## [0.7.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.6.0...v0.7.0) (2026-08-07)
 
 
