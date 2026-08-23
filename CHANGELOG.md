@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.8.0...v0.8.1) (2026-08-23)
+
+
+### Bug Fixes
+
+* drop claude-code-guide from the built-in agent roster ([36a9ac6](https://github.com/lucascouts/claude-agent-acp-plus/commit/36a9ac6fb5122f8c52145f544ca6d27cf2da7d51))
+* **test:** accept the SDK's requestId in the dialog callback options ([5d823b5](https://github.com/lucascouts/claude-agent-acp-plus/commit/5d823b503d3cf5b16cb0dff72fa6be75b50e7c3b))
+
 ## [0.8.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.7.0...v0.8.0) (2026-08-23)
 
 
