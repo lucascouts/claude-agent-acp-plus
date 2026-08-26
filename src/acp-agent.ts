@@ -5190,10 +5190,9 @@ export class ClaudeAcpAgent {
       throw new Error(`Unknown config option: ${params.configId}`);
     }
 
-    // Fast mode is always emitted as an "on"/"off" select, but a native
-    // boolean set value is still accepted for compatibility (R2.3), so it
-    // bypasses the string-only validation the select-style options below
-    // rely on.
+    // Fast mode carries a boolean value (for Clients that opted into boolean
+    // config options) or the "on"/"off" select fallback, so it bypasses the
+    // string-only validation the select-style options below rely on.
     if (params.configId === FAST_MODE_CONFIG_ID) {
       await this.applyFastMode(session, resolveFastModeEnabled(params));
       return { configOptions: session.configOptions };
@@ -5966,6 +5965,7 @@ export class ClaudeAcpAgent {
           // intent) when a supporting model is selected again.
           supported: newModelInfo?.supportsFastMode ?? false,
           enabled: session.fastModeEnabled,
+          useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
           disabledReason: session.fastModeDisabledReason,
         },
         // Thinking is model-independent: re-render the retained tri-state
@@ -6060,13 +6060,15 @@ export class ClaudeAcpAgent {
   }
 
   /** Replace the Fast mode option in `session.configOptions` so it reflects
-   *  `enabled` (and the session's current disabled reason). A no-op when the
+   *  `enabled` (and the client's current boolean-capability). A no-op when the
    *  option isn't present, so callers must confirm the current model surfaces
-   *  it first. Rebuilds through {@link createFastModeConfigOption} — the one
-   *  source of the option's shape — so the shape can't drift from what
-   *  `buildConfigOptions` first emitted. */
+   *  it first. */
   private refreshFastModeOption(session: Session, enabled: boolean): void {
-    const refreshed = createFastModeConfigOption(enabled, session.fastModeDisabledReason);
+    const refreshed = createFastModeConfigOption(
+      enabled,
+      clientSupportsBooleanConfigOptions(this.clientCapabilities),
+      session.fastModeDisabledReason,
+    );
     session.configOptions = session.configOptions.map((o) =>
       o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
     );
@@ -7019,6 +7021,7 @@ export class ClaudeAcpAgent {
     const fastMode: FastModeOptionState = {
       supported: currentModelInfo?.supportsFastMode ?? false,
       enabled: fastModeEnabled,
+      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
       disabledReason: fastModeDisabledReason,
     };
 
@@ -7415,8 +7418,8 @@ export const MODEL_CONFIG_ID = "model";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
 
-/** Select values for the Fast mode on/off option
- *  (see {@link createFastModeConfigOption}). */
+/** Select-fallback values used when the client has not opted into boolean
+ *  config options (see {@link createFastModeConfigOption}). */
 export const FAST_MODE_ON = "on";
 export const FAST_MODE_OFF = "off";
 const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
@@ -7459,36 +7462,47 @@ export function normalizeFastModeDisabledReason(
   return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
 }
 
-/** Build the Fast mode config option as a two-value on/off `select`. Emitted
- *  for EVERY Client — the boolean option shape is gone (story 006, R2.1;
- *  retained through the v0.64.0 sync by story 008 R3.4). Only the emitted SHAPE
- *  is fixed to a select; boolean VALUES are still honored on set (see
- *  {@link resolveFastModeEnabled}). This factory is the single source of the
- *  option's shape, re-rendered by `refreshFastModeOption` / `syncFastModeState`
- *  so the shape can never desync.
+/** Whether the Client advertised support for boolean session config options
+ *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
+ *  config options to Clients that opt in; otherwise we fall back to a `select`.
+ *  See https://agentclientprotocol.com/rfds/boolean-config-option. */
+export function clientSupportsBooleanConfigOptions(
+  clientCapabilities?: ClientCapabilities | null,
+): boolean {
+  return clientCapabilities?.session?.configOptions?.boolean != null;
+}
+
+/** Build the Fast mode config option. When the Client supports boolean config
+ *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
+ *  a two-value `select` ("on"/"off") so older Clients still get a usable
+ *  control.
  *
- *  `disabledReason` (the SDK's `fast_mode_disabled_reason`, upstream v0.64.0) is
- *  folded into the description while the toggle reads off, so a user whose
- *  account or provider can't serve Fast mode sees why instead of a switch that
- *  silently refuses to stay on. Ignored while enabled: a reason reported
- *  alongside an `on`/`cooldown` state isn't blocking anything right now.
- *
- *  Upstream's second parameter (`useBooleanOption`) is deliberately absent: the
- *  shape is unconditionally a select, so there is no branch to select. What
- *  guards that is behavioural, not structural — `tests/fast-mode-select-only.
- *  test.ts` proves no argument combination can yield the boolean shape. */
+ *  `disabledReason` (the SDK's `fast_mode_disabled_reason`) is folded into the
+ *  description while the toggle reads off, so a user whose account or provider
+ *  can't serve Fast mode sees why instead of a switch that silently refuses to
+ *  stay on. Ignored while enabled: a reason reported alongside an `on`/`cooldown`
+ *  state isn't blocking anything right now. */
 export function createFastModeConfigOption(
   enabled: boolean,
+  useBooleanOption: boolean,
   disabledReason?: FastModeDisabledReason,
 ): SessionConfigOption {
   const explanation = enabled
     ? undefined
     : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
-  return {
+  const base = {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
     description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
     category: "model_config",
+  } as const;
+
+  if (useBooleanOption) {
+    return { ...base, type: "boolean", currentValue: enabled };
+  }
+
+  return {
+    ...base,
     type: "select",
     currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
     options: [
@@ -7499,9 +7513,9 @@ export function createFastModeConfigOption(
 }
 
 /** Resolve the requested Fast mode value from a `session/set_config_option`
- *  request. Accepts the select's "on"/"off" strings or a native boolean,
- *  kept for backward compatibility (R2.3). */
-export function resolveFastModeEnabled(params: { value: unknown }): boolean {
+ *  request. Accepts a native boolean (boolean-capable Clients) or the
+ *  "on"/"off" select-fallback strings. */
+export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): boolean {
   const value = params.value;
   if (typeof value === "boolean") {
     return value;
@@ -7520,6 +7534,8 @@ export function resolveFastModeEnabled(params: { value: unknown }): boolean {
 export type FastModeOptionState = {
   supported: boolean;
   enabled: boolean;
+  /** Whether the Client opted into boolean config options. */
+  useBooleanOption: boolean;
   /** Latest explainable `fast_mode_disabled_reason`, folded into the option's
    *  description while the toggle reads off. */
   disabledReason?: FastModeDisabledReason;
@@ -7603,10 +7619,16 @@ export function buildConfigOptions(
   }
 
   // Surface the Fast mode toggle only when the current model supports it. The
-  // option is always emitted as a two-value on/off select for every Client
-  // (R2.1); boolean values remain accepted on set for boolean-era clients.
+  // option renders as a native boolean toggle for Clients that opted in, and a
+  // two-value select otherwise.
   if (fastMode?.supported) {
-    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.disabledReason));
+    options.push(
+      createFastModeConfigOption(
+        fastMode.enabled,
+        fastMode.useBooleanOption,
+        fastMode.disabledReason,
+      ),
+    );
   }
 
   // Surface the Thinking toggle whenever the caller supplies its display
