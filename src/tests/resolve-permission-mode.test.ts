@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { resolvePermissionMode, type Logger } from "../acp-agent.js";
+import type { Logger } from "../acp-agent.js";
+import { resolvePermissionMode } from "../permissions/modes.js";
 
 function mockLogger() {
   const error = vi.fn<(...args: any[]) => void>();
@@ -39,7 +40,7 @@ async function loadResolver(bypassAllowed: boolean) {
     };
   }
 
-  return (await import("../acp-agent.js")).resolvePermissionMode;
+  return (await import("../permissions/modes.js")).resolvePermissionMode;
 }
 
 afterEach(() => {

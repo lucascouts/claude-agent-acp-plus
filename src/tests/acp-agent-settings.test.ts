@@ -94,6 +94,10 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(getCapturedOptions().permissionMode).toBe("dontAsk");
     expect(getCapturedOptions().settingSources).toEqual(["user", "project", "local"]);
+    // Fork divergence: upstream accepts `dontAsk` in `parseMode` but never advertises
+    // it, so its own assertion here is the fallback to `default` that an unavailable
+    // mode produces. The fork re-implants `dontAsk` into the advertised catalogue
+    // (R2.5), so a configured `permissions.defaultMode: "dontAsk"` is honoured.
     expect(response.modes.currentModeId).toBe("dontAsk");
   });
 
@@ -253,7 +257,7 @@ describe("ClaudeAcpAgent settings", () => {
       };
     }
 
-    it("omits `auto` from availableModes when the resolved model lacks supportsAutoMode", async () => {
+    it("advertises `auto` when the resolved model lacks supportsAutoMode", async () => {
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
 
@@ -276,10 +280,9 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
-      expect(modeIds).not.toContain("auto");
-      expect(modeIds).toEqual(
-        expect.arrayContaining(["default", "acceptEdits", "plan", "dontAsk"]),
-      );
+      expect(modeIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]));
+      // Fork override (R2.5): upstream does not advertise `dontAsk`; the fork does.
+      expect(modeIds).toContain("dontAsk");
     });
 
     it("includes `auto` when the resolved model has supportsAutoMode: true", async () => {
@@ -305,10 +308,51 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
-      expect(modeIds).toContain("auto");
+      expect(response.modes.availableModes.slice(0, 4)).toEqual([
+        {
+          id: "default",
+          name: "Manual",
+          description: "Always ask before making changes",
+          _meta: { kind: "standard" },
+        },
+        {
+          id: "acceptEdits",
+          name: "Accept edits",
+          description: "Automatically accept all file edits",
+          _meta: { kind: "standard" },
+        },
+        {
+          id: "plan",
+          name: "Plan",
+          description: "Create a plan before making changes",
+          _meta: { kind: "plan" },
+        },
+        {
+          id: "auto",
+          name: "Auto",
+          description: "Claude handles permission decisions",
+          _meta: { kind: "auto_review" },
+        },
+      ]);
+      // The fork's re-implanted `dontAsk` sits at index 4, so bypass moved to 5.
+      expect(response.modes.availableModes[4]).toEqual({
+        id: "dontAsk",
+        name: "Don't Ask",
+        description: "Don't prompt for permissions, deny if not pre-approved",
+      });
+      const bypass = response.modes.availableModes[5];
+      if (bypass) {
+        expect(bypass).toEqual({
+          id: "bypassPermissions",
+          name: "Bypass permissions",
+          description: "Accepts all permissions",
+          _meta: { kind: "full_access" },
+        });
+      }
+      expect(modeIds).toContain("dontAsk");
     });
 
-    it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {
+    it("falls back permissions.defaultMode='auto' to Accept edits on an unsupported model", async () => {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
         JSON.stringify({ permissions: { defaultMode: "auto" } }),
@@ -342,9 +386,11 @@ describe("ClaudeAcpAgent settings", () => {
         // carries the user-typed value; the SDK was synced via
         // setPermissionMode after we discovered the model can't honor it.
         expect(getCapturedOptions().permissionMode).toBe("auto");
-        expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
-        expect(response.modes.currentModeId).toBe("default");
-        expect(response.modes.availableModes.map((m: any) => m.id)).not.toContain("auto");
+        expect(setPermissionModeSpy).toHaveBeenCalledWith("acceptEdits");
+        expect(response.modes.currentModeId).toBe("acceptEdits");
+        expect(response.modes.availableModes.map((m: any) => m.id)).toContain("auto");
+        const session = (agent as any).sessions[response.sessionId];
+        expect(session.autoModeFallbackWarningPending).toBe(true);
 
         // A descriptive warning was logged so operators see the clamp.
         const messages = errorSpy.mock.calls.map((c) => c.join(" "));
