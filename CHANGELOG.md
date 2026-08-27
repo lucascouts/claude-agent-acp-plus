@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.8.1...v0.9.0) (2026-08-27)
+
+
+### Features
+
+* port upstream v0.70.0 — permissions extracted into modules, session titles, task-plan persistence ([68777a7](https://github.com/lucascouts/claude-agent-acp-plus/commit/68777a73c4f450ba926a1e8b5cd913add11bed1b))
+
 ## [0.8.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.8.0...v0.8.1) (2026-08-23)
 
 
