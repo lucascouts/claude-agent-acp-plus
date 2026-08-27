@@ -307,10 +307,13 @@ export class SessionModeManager<S extends SessionMode> {
         description: "Claude handles permission decisions",
         _meta: { kind: "auto_review" },
       },
-      // Fork override, re-implanted here from the pre-merge `buildAvailableModes`
-      // in `acp-agent.ts`: upstream accepts `dontAsk` in `parseMode` but never
-      // advertises it, so adopting upstream's catalog wholesale would silently
-      // drop a mode the fork has offered since story 006 (R2.5 names it).
+      // Re-implanted here — but NOT a fork override, and the attribution matters
+      // to the next sync. `dontAsk` is upstream's own: introduced by 4db3d85
+      // (#192) and still present in the merge base, then dropped from the
+      // advertised catalogue by 996d488 (#1004) while `parseMode` went on
+      // accepting it. Adopting upstream's new catalogue wholesale would have left
+      // the adapter offering five modes where it had offered six, silently.
+      // R2.5 names all six; the merge rescued upstream's code, not the fork's.
       // No `_meta.kind` is set: upstream's four kinds all describe a mode that
       // asks or auto-approves, and `dontAsk` denies instead — claiming any of
       // them would assert a semantic upstream has not defined for this mode.
