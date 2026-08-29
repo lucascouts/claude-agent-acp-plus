@@ -272,9 +272,13 @@ const STEER_METHOD = "_session/steering";
  *  turn — an internal Claude implementation detail, not part of the wire
  *  contract. `now` pre-empts the current generation and handles the message
  *  immediately (interrupting a single-shot response, or slotting in between a
- *  multi-step turn's tool calls). Maps to `SDKUserMessage.priority`; injected
- *  steering always uses `now` so the running turn adapts as soon as possible. */
-const STEER_PRIORITY = "now" as const;
+ *  multi-step turn's tool calls), while `later` waits for a pending
+ *  permission/elicitation callback to settle instead of cancelling its ACP
+ *  request and hiding the client's user-input card (IJAI-1191). Maps to
+ *  `SDKUserMessage.priority`; injected steering uses `now` unless the session is
+ *  awaiting user input (see `Session.pendingUserInputCount`). */
+const STEER_PRIORITY_NOW = "now" as const;
+const STEER_PRIORITY_LATER = "later" as const;
 
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
  *  keep the established idle fallback behavior. */
@@ -288,7 +292,7 @@ type SteerMeta = {
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
+ *  chooses (see {@link STEER_PRIORITY_NOW} / {@link STEER_PRIORITY_LATER}). */
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
@@ -435,8 +439,8 @@ type Turn = {
   deferredSettle?: PromptResponse;
   /** Uuids of `steer()`-injected messages the SDK has not replayed back yet.
    *
-   *  A steer is delivered at {@link STEER_PRIORITY} (`now`), so the CLI ABORTS
-   *  the running cycle: it emits its own human-origin `result` —
+   *  A steer is normally delivered at {@link STEER_PRIORITY_NOW}, so the CLI
+   *  ABORTS the running cycle: it emits its own human-origin `result` —
    *  indistinguishable from a turn's terminal one — and the steered message runs
    *  as a SECOND cycle. Settling at that result would answer `session/prompt`
    *  mid-work, so a steered turn's results only RECORD their outcome
@@ -635,6 +639,12 @@ export type Session = {
   /** Whether nested subagent text/thinking is forwarded to the ACP client.
    *  Enabled by either the ACP capability or the pre-existing SDK option. */
   forwardSubagentText: boolean;
+  /** Number of ACP permission/elicitation requests currently awaiting user
+   *  input. A counter rather than a boolean because parallel subagents can ask
+   *  concurrently; steering must stay non-interrupting until the LAST of them
+   *  settles. Maintained by `withPendingUserInput`, which owns every increment
+   *  and decrement. */
+  pendingUserInputCount?: number;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
@@ -2147,11 +2157,14 @@ export class ClaudeAcpAgent {
    *  an `SDKUserMessage` onto the same streaming input, which the SDK routes
    *  into the in-flight turn. The injected message's echo carries a uuid that
    *  matches no queued turn, so the consumer drops it as an unrelated replay
-   *  without promoting/settling anything. It is delivered at {@link
-   *  STEER_PRIORITY} (`now`) so it pre-empts the current generation (interrupting
-   *  a single-shot response, or slotting in between a multi-step turn's tool
-   *  calls). The steered message's own output streams via `session/update`, not
-   *  this response.
+   *  without promoting/settling anything. It is normally delivered at {@link
+   *  STEER_PRIORITY_NOW} so it pre-empts the current generation (interrupting a
+   *  single-shot response, or slotting in between a multi-step turn's tool
+   *  calls). While a permission or elicitation is awaiting user input it uses
+   *  {@link STEER_PRIORITY_LATER} instead, because interrupting that SDK
+   *  callback cancels the ACP request and can strand the prompt (IJAI-1191).
+   *  The steered message's own output streams via `session/update`, not this
+   *  response.
    *
    *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
    *  own and the steered message runs as a second one, so the turn is marked
@@ -2205,8 +2218,11 @@ export class ClaudeAcpAgent {
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
-    // prompt would.
-    userMessage.priority = STEER_PRIORITY;
+    // prompt would. A steer landing while the client has a permission or
+    // elicitation card open must not pre-empt it — the interrupt cancels that
+    // ACP request — so it waits for the LAST such request to settle instead.
+    userMessage.priority =
+      (session.pendingUserInputCount ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
@@ -5471,6 +5487,28 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /** Mark a client request as blocking on user input for exactly the lifetime
+   *  of its promise. Steering consults this session-local count synchronously,
+   *  so a message arriving while any permission/elicitation card is open uses
+   *  non-interrupting SDK delivery. The decrement sits in `finally` (and is
+   *  clamped at zero), so accepted, declined, cancelled, aborted and failed
+   *  requests all settle the count — a request that ends by throwing must not
+   *  pin the session at `later` for the rest of its life. */
+  private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+    const session = this.sessions[sessionId];
+    if (!session) return request();
+    session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
+    try {
+      return await request();
+    } finally {
+      // Decrement the SAME object the increment ran on, not a fresh
+      // `this.sessions[sessionId]` lookup: a session replaced mid-request would
+      // otherwise be charged for a request it never made. Both the clamp and
+      // the `?? 1` land such a replacement's own count on 0, never below it.
+      session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
+    }
+  }
+
   /** Forward a permission request to the client, wiring the tool call's
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
@@ -5504,7 +5542,9 @@ export class ClaudeAcpAgent {
     // cancellation signal. The local race guarantees that Claude's tool call
     // is released even when an older or broken client ignores $/cancel_request.
     try {
-      return await raceWithAbort(this.client.requestPermission(params, signal), signal);
+      return await this.withPendingUserInput(params.sessionId, () =>
+        raceWithAbort(this.client.requestPermission(params, signal), signal),
+      );
     } catch (error) {
       if (signal.aborted) {
         throw new Error("Tool use aborted", { cause: error });
@@ -5773,7 +5813,9 @@ export class ClaudeAcpAgent {
       }
 
       try {
-        const response = await this.client.unstable_createElicitation(createRequest, signal);
+        const response = await this.withPendingUserInput(sessionId, () =>
+          this.client.unstable_createElicitation(createRequest, signal),
+        );
         if (signal.aborted) {
           return { action: "cancel" };
         }
@@ -5809,7 +5851,9 @@ export class ClaudeAcpAgent {
     const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);
     let response;
     try {
-      response = await this.client.unstable_createElicitation(createRequest, signal);
+      response = await this.withPendingUserInput(sessionId, () =>
+        this.client.unstable_createElicitation(createRequest, signal),
+      );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
       // use, matching the post-response check below.
@@ -5852,9 +5896,11 @@ export class ClaudeAcpAgent {
       }
       let response: CreateElicitationResponse;
       try {
-        response = await this.client.unstable_createElicitation(
-          refusalFallbackToCreateRequest(prompt, sessionId),
-          signal,
+        response = await this.withPendingUserInput(sessionId, () =>
+          this.client.unstable_createElicitation(
+            refusalFallbackToCreateRequest(prompt, sessionId),
+            signal,
+          ),
         );
       } catch (error) {
         // A cancellation we requested (signal aborted) is expected teardown;
