@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.9.0...v0.10.0) (2026-09-02)
+
+
+### Features
+
+* **acp:** defer steering while input is pending, and align the SDK ([71a6a64](https://github.com/lucascouts/claude-agent-acp-plus/commit/71a6a64c63a1587ff9ffb442551c88f4cab6bfd0))
+
+
+### Bug Fixes
+
+* **tools:** parse a TaskList line in linear time ([#73](https://github.com/lucascouts/claude-agent-acp-plus/issues/73)) ([1ed41b0](https://github.com/lucascouts/claude-agent-acp-plus/commit/1ed41b03e1872531a55e65ba4c991310e4a75d1c))
+
 ## [0.9.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.8.1...v0.9.0) (2026-08-27)
 
 
