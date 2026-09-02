@@ -1132,6 +1132,21 @@ export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | unde
   return undefined;
 }
 
+// A task line is `#id [status] subject`, optionally followed by ` (owner)` and then by
+// ` [blocked by #a, #b]`. Matching all four parts in one regex made two of them
+// ambiguous: `[^,\]]` also matches `#`, so a blocked-by list like `#a#a#a` could be
+// split 2^(k-1) ways, and every split was retried whenever the line failed to close
+// with `]`. An 87-byte line took three seconds; ten more characters took hours
+// (CWE-1333, CodeQL js/redos and js/polynomial-redos).
+//
+// Anchoring each optional part to the end of the line and stripping it in turn removes
+// the ambiguity rather than bounding it: `[^,\]]` cannot match `,`, so each `, ` is a
+// forced boundary and no alternative split exists to backtrack into. The grammar
+// accepted is unchanged, trailing separator included.
+const TASK_LINE_RE = /^#(\S+) \[(pending|in_progress|completed)\] (.+)$/;
+const TASK_OWNER_SUFFIX_RE = / \(([^()]*)\)$/;
+const TASK_BLOCKED_SUFFIX_RE = / \[blocked by (#[^,\]]+(?:, #[^,\]]+)*(?:, )?)\]$/;
+
 export function parseTaskListOutput(content: unknown): TaskListOutput | undefined {
   const validStatuses = new Set(["pending", "in_progress", "completed"]);
   const structured = parseJsonToolOutput(content, (parsed): parsed is TaskListOutput =>
@@ -1159,20 +1174,33 @@ export function parseTaskListOutput(content: unknown): TaskListOutput | undefine
     const tasks: TaskListOutput["tasks"] = [];
     const lines = text.trim().split("\n");
     for (const line of lines) {
-      const match =
-        /^#(\S+) \[(pending|in_progress|completed)\] (.+?)(?: \(([^()]*)\))?(?: \[blocked by ((?:#[^,\]]+(?:, )?)+)\])?$/.exec(
-          line,
-        );
-      if (!match) {
+      const head = TASK_LINE_RE.exec(line);
+      if (!head) {
         tasks.length = 0;
         break;
       }
+      // Strip from the right, blocked-by before owner: that is the order the parts
+      // appear in, so each strip exposes the next one's anchor. `index > 0` keeps the
+      // subject non-empty, which the `(.+?)` this replaces required of it.
+      let subject = head[3];
+      let blockedBy: TaskListOutput["tasks"][number]["blockedBy"] = [];
+      const blocked = TASK_BLOCKED_SUFFIX_RE.exec(subject);
+      if (blocked && blocked.index > 0) {
+        blockedBy = blocked[1].split(", ").map((id) => id.slice(1));
+        subject = subject.slice(0, blocked.index);
+      }
+      let owner: string | undefined;
+      const ownerSuffix = TASK_OWNER_SUFFIX_RE.exec(subject);
+      if (ownerSuffix && ownerSuffix.index > 0) {
+        owner = ownerSuffix[1];
+        subject = subject.slice(0, ownerSuffix.index);
+      }
       tasks.push({
-        id: match[1],
-        subject: match[3],
-        status: match[2] as TaskListOutput["tasks"][number]["status"],
-        ...(match[4] ? { owner: match[4] } : {}),
-        blockedBy: match[5] ? match[5].split(", ").map((id) => id.slice(1)) : [],
+        id: head[1],
+        subject,
+        status: head[2] as TaskListOutput["tasks"][number]["status"],
+        ...(owner ? { owner } : {}),
+        blockedBy,
       });
     }
     if (tasks.length > 0) return { tasks };
