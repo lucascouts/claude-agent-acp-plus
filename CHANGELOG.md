@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.10.0...v0.10.1) (2026-09-02)
+
+
+### Miscellaneous Chores
+
+* release 0.10.1 ([#74](https://github.com/lucascouts/claude-agent-acp-plus/issues/74)) ([eca4a98](https://github.com/lucascouts/claude-agent-acp-plus/commit/eca4a982cb97f218096e26d82e4ec5a316e1d87a))
+
 ## [0.10.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.9.0...v0.10.0) (2026-09-02)
 
 
