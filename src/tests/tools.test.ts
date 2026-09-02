@@ -2073,6 +2073,77 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
 
     expect(parseTaskListOutput("No tasks found")).toEqual({ tasks: [] });
   });
+
+  it("keeps subject, owner and blocked-by apart when the subject looks like either", () => {
+    expect(
+      parseTaskListOutput(
+        [
+          "#1 [pending] Ship it (alice) [blocked by #2, #3]",
+          "#2 [pending] Fix (the) parens",
+          "#3 [pending] Close #4 [blocked by #5] first [blocked by #6]",
+          "#4 [pending] Nest it [blocked by #5 [blocked by #6]",
+          "#7 [completed] Tolerate a trailing separator [blocked by #8, ]",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      tasks: [
+        {
+          id: "1",
+          subject: "Ship it",
+          status: "pending",
+          owner: "alice",
+          blockedBy: ["2", "3"],
+        },
+        { id: "2", subject: "Fix (the) parens", status: "pending", blockedBy: [] },
+        {
+          id: "3",
+          subject: "Close #4 [blocked by #5] first",
+          status: "pending",
+          blockedBy: ["6"],
+        },
+        // The last opener wins, so the leading `[blocked by #5` stays in the subject
+        // instead of becoming a blocking id of its own.
+        {
+          id: "4",
+          subject: "Nest it [blocked by #5",
+          status: "pending",
+          blockedBy: ["6"],
+        },
+        {
+          id: "7",
+          subject: "Tolerate a trailing separator",
+          status: "completed",
+          blockedBy: ["8", ""],
+        },
+      ],
+    });
+  });
+
+  // Two CodeQL witnesses, one per way this parser used to blow up. `+#` repeated is
+  // js/redos against the single-regex version, which took 47.7 s on a 92-byte line and
+  // could not reach this size at all; ` [blocked by #` repeated is js/polynomial-redos
+  // against the `$`-anchored-only version that replaced it, which takes 1147 ms here.
+  // Both measured on this machine, and the budget below is set from the second: 250 ms
+  // leaves it 4.6x over while the parser needs 2 ms.
+  //
+  // Asserting on the clock is what catches either coming back. An output assertion
+  // cannot: both old versions returned the right answer, just far too late.
+  it.each([
+    ["exponential: an ambiguous element split", "+#"],
+    ["quadratic: a retried start position", " [blocked by #"],
+  ])("parses an adversarial blocked-by list in linear time (%s)", (_name, unit) => {
+    const prefix = "#! [pending] ";
+    const line = `${prefix}a [blocked by #${unit.repeat(16000)}`;
+    const started = performance.now();
+    const parsed = parseTaskListOutput(line);
+    const elapsed = performance.now() - started;
+    // Never closed with `]`, so the blocked-by suffix does not apply and the whole
+    // remainder stays the subject — the same answer both old versions reached slowly.
+    expect(parsed).toEqual({
+      tasks: [{ id: "!", subject: line.slice(prefix.length), status: "pending", blockedBy: [] }],
+    });
+    expect(elapsed).toBeLessThan(250);
+  });
 });
 
 describe("toAcpNotifications - Task* tools", () => {
