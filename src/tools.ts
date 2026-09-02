@@ -1133,19 +1133,44 @@ export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | unde
 }
 
 // A task line is `#id [status] subject`, optionally followed by ` (owner)` and then by
-// ` [blocked by #a, #b]`. Matching all four parts in one regex made two of them
-// ambiguous: `[^,\]]` also matches `#`, so a blocked-by list like `#a#a#a` could be
-// split 2^(k-1) ways, and every split was retried whenever the line failed to close
-// with `]`. An 87-byte line took three seconds; ten more characters took hours
-// (CWE-1333, CodeQL js/redos and js/polynomial-redos).
+// ` [blocked by #a, #b]`. Two things about that shape cost superlinear time if the
+// parse is left to a regex engine, and only one of them is obvious.
 //
-// Anchoring each optional part to the end of the line and stripping it in turn removes
-// the ambiguity rather than bounding it: `[^,\]]` cannot match `,`, so each `, ` is a
-// forced boundary and no alternative split exists to backtrack into. The grammar
-// accepted is unchanged, trailing separator included.
+// The ambiguity. `[^,\]]` also matches `#`, so a list written `#a#a#a` splits 2^(k-1)
+// ways, and one regex covering all four parts retried every split whenever the line
+// failed to close with `]`. An 87-byte line took 3.1 s; each further pair of characters
+// quadrupled it. Fixed by giving each list element a forced boundary: `[^,\]]` cannot
+// match `,`, so `, ` is the only place an element can end and no alternative split
+// exists to backtrack into.
+//
+// The start position. That alone is not enough. A suffix pattern anchored only at `$`
+// lets the engine retry from every ` [blocked by #` in the line, each retry scanning to
+// the end — quadratic, which is what CodeQL flagged next: 224 KB took 1.2 s. So the
+// opener is located once with lastIndexOf and the shape is anchored at both ends,
+// leaving exactly one start to try. 3.5 MB now parses in 1.5 ms.
+//
+// Taking the LAST opener rather than the leftmost match is the one behavioural change,
+// and it needs a subject that itself contains ` [blocked by #` to show: `a [blocked by
+// #x [blocked by #1]` used to yield the single blocking id `x [blocked by #1`, and now
+// yields `1` with the rest left in the subject. Differential run over 8400 lines: those
+// 15 and nothing else. An id carrying brackets and spaces was never a real id.
 const TASK_LINE_RE = /^#(\S+) \[(pending|in_progress|completed)\] (.+)$/;
-const TASK_OWNER_SUFFIX_RE = / \(([^()]*)\)$/;
-const TASK_BLOCKED_SUFFIX_RE = / \[blocked by (#[^,\]]+(?:, #[^,\]]+)*(?:, )?)\]$/;
+const TASK_OWNER_SUFFIX_RE = /^ \(([^()]*)\)$/;
+const TASK_BLOCKED_SUFFIX_RE = /^ \[blocked by (#[^,\]]+(?:, #[^,\]]+)*(?:, )?)\]$/;
+
+function splitTaskSuffix(
+  subject: string,
+  opener: string,
+  closer: string,
+  shape: RegExp,
+): { subject: string; captured: string } | undefined {
+  if (!subject.endsWith(closer)) return undefined;
+  const at = subject.lastIndexOf(opener);
+  // `at > 0` keeps the subject non-empty, which the `(.+?)` this replaces required.
+  if (at <= 0) return undefined;
+  const match = shape.exec(subject.slice(at));
+  return match ? { subject: subject.slice(0, at), captured: match[1] } : undefined;
+}
 
 export function parseTaskListOutput(content: unknown): TaskListOutput | undefined {
   const validStatuses = new Set(["pending", "in_progress", "completed"]);
@@ -1180,20 +1205,19 @@ export function parseTaskListOutput(content: unknown): TaskListOutput | undefine
         break;
       }
       // Strip from the right, blocked-by before owner: that is the order the parts
-      // appear in, so each strip exposes the next one's anchor. `index > 0` keeps the
-      // subject non-empty, which the `(.+?)` this replaces required of it.
+      // appear in, so each strip exposes the next one's closer.
       let subject = head[3];
       let blockedBy: TaskListOutput["tasks"][number]["blockedBy"] = [];
-      const blocked = TASK_BLOCKED_SUFFIX_RE.exec(subject);
-      if (blocked && blocked.index > 0) {
-        blockedBy = blocked[1].split(", ").map((id) => id.slice(1));
-        subject = subject.slice(0, blocked.index);
+      const blocked = splitTaskSuffix(subject, " [blocked by #", "]", TASK_BLOCKED_SUFFIX_RE);
+      if (blocked) {
+        blockedBy = blocked.captured.split(", ").map((id) => id.slice(1));
+        subject = blocked.subject;
       }
       let owner: string | undefined;
-      const ownerSuffix = TASK_OWNER_SUFFIX_RE.exec(subject);
-      if (ownerSuffix && ownerSuffix.index > 0) {
-        owner = ownerSuffix[1];
-        subject = subject.slice(0, ownerSuffix.index);
+      const ownerSuffix = splitTaskSuffix(subject, " (", ")", TASK_OWNER_SUFFIX_RE);
+      if (ownerSuffix) {
+        owner = ownerSuffix.captured;
+        subject = ownerSuffix.subject;
       }
       tasks.push({
         id: head[1],
