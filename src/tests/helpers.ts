@@ -9,6 +9,24 @@
  *  don't shift in tests that don't care about context usage. */
 export const DEFAULT_CONTEXT_USAGE = { totalTokens: 0, rawMaxTokens: 200000 };
 
+/** The structured usage report for a session where plan rate limits do not
+ *  apply (API key, Bedrock, Vertex): `rate_limits` is null and no quota window
+ *  is emitted from it. */
+export const NO_PLAN_RATE_LIMITS = {
+  session: {
+    total_cost_usd: 0,
+    total_api_duration_ms: 0,
+    total_duration_ms: 0,
+    total_lines_added: 0,
+    total_lines_removed: 0,
+    model_usage: {},
+  },
+  subscription_type: null,
+  rate_limits_available: false,
+  rate_limits: null,
+  behaviors: null,
+};
+
 /**
  * Base stub for the SDK `query()` return object, covering the surface
  * ClaudeAcpAgent touches unconditionally at session creation. Tests pass
@@ -28,6 +46,12 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
     setPermissionMode: async () => {},
     supportedCommands: async () => [],
     getContextUsage: async () => DEFAULT_CONTEXT_USAGE,
+    // The structured `/usage` report (story 002). Defaults to a session where
+    // plan rate limits do not apply, so a suite that does not care about quota
+    // windows sees no extra notification; suites that do care override it.
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+      ...NO_PLAN_RATE_LIMITS,
+    }),
     close: () => {},
     interrupt: async () => undefined,
     [Symbol.asyncIterator]: async function* () {},

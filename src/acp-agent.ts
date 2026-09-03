@@ -189,6 +189,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import { AccountUsageTracker } from "./account-usage.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -656,7 +657,39 @@ export type Session = {
    *  fresh session it stalls until the first turn runs (see the seeding call
    *  sites and `contextWindowCache`). */
   contextWindowSize: number;
+  /** Context-window occupancy last reported for this session, in tokens — the
+   *  `used` half of every `usage_update`. `undefined` means nothing has been
+   *  READ yet, which is a different statement from a measured zero and is
+   *  treated as one: the permission request's `contextUsedPercent` omits the
+   *  figure entirely rather than showing 0%.
+   *
+   *  Written by the turn itself (each top-level assistant message's usage, and
+   *  the compact boundary's `getContextUsage`), and seeded once at session
+   *  creation on session/load — never on session/new — from the resumed
+   *  session's own `getContextUsage` report, the same response
+   *  `getAvailableModels` already awaits to learn the live model, so no extra
+   *  IPC (see `readResumedLiveModel`). Without that seed a thread reloaded
+   *  with real context reported `used: 0` until its first turn ended, and the
+   *  client renders that as an empty ring rather than as "unknown": its
+   *  `UsageUpdate` arm assigns `used`/`size` unconditionally and creates the
+   *  token-usage record where there was none. A fresh session really has used
+   *  nothing, so `publishAccountUsage` reporting its `undefined` as 0 is not
+   *  the same defect and stays as it is. */
   contextUsedTokens?: number;
+  /** Maps this session's structured `/usage` reports onto the quota-window
+   *  payloads the client ingests, and remembers the status a live
+   *  `rate_limit_event` MEASURED for as long as that window instance lasts
+   *  (see {@link AccountUsageTracker}).
+   *
+   *  Session-scoped on purpose, and in both directions: the memory has to
+   *  outlive a turn (a five-hour window measured on turn one still governs
+   *  turn nine) and must never outlive the session (it is per-account state,
+   *  and two sessions can run against different accounts). Living on the
+   *  Session gives it exactly that lifetime — a consumer local would lose it
+   *  on the lazy Thinking recreate, which starts a fresh consumer mid-session.
+   *  Always set by `createSession`; optional only because tests hand-build
+   *  Session objects, so the accessor creates it on demand. */
+  accountUsage?: AccountUsageTracker;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a resumed session's `getContextUsage` report, or a
    *  `result.modelUsage`) rather than the text heuristic / default. Guards the
@@ -2109,6 +2142,74 @@ export class ClaudeAcpAgent {
         entries: taskStateToPlanEntries(taskState),
       },
     });
+  }
+
+  /** This session's quota-window mapper, created on first use (see
+   *  {@link Session.accountUsage} for why it lives on the Session). */
+  private accountUsageTracker(session: Session): AccountUsageTracker {
+    return (session.accountUsage ??= new AccountUsageTracker());
+  }
+
+  /**
+   * Ask the SDK for the structured `/usage` report and forward every quota
+   * window it carries to the client (R1.1 at session establishment, R1.2 at the
+   * end of each turn).
+   *
+   * ONE notification per window, never one aggregate: the client's
+   * `AccountUsage::ingest` reads a single `rateLimitType` per payload and merges
+   * by kind, so it is the sequence that accumulates into a full panel.
+   *
+   * Total by construction (R1.7). The report rides an SDK method whose own
+   * declaration says it "may change or be removed in any release without
+   * notice", so a rejection, a method that no longer exists, a response shaped
+   * differently than declared, or a client channel that has gone away must all
+   * cost the windows and nothing else — never the session. The failure is
+   * logged (which window kinds went unreported is not knowable, so the log says
+   * only that the request failed and why) and the previously reported windows
+   * are left standing, because nothing was sent.
+   */
+  private async publishAccountUsage(sessionId: string, session: Session): Promise<void> {
+    try {
+      // Not `getUsage`: this awful spelling is the only name the real `Query`
+      // answers to, and it is written out here rather than hidden behind a
+      // helper so a rename lands as one named failure in the log below, not as
+      // a quiet degradation to no report at all.
+      const report =
+        await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      // The session can be torn down or recreated while the request is in
+      // flight (provider switch, a changed cwd on session/load). A successor
+      // must not inherit its predecessor's windows.
+      if (this.sessions[sessionId] !== session) {
+        return;
+      }
+      // `usage_update` is the only carrier ACP gives this `_meta`, and it
+      // requires both numbers. `contextUsedTokens` is the session-scoped mirror
+      // of the consumer's `lastAssistantTotalUsage`, so at the end of a turn
+      // this is the same occupancy the turn's own usage_update reported. At
+      // session establishment nothing has been measured yet and 0 says exactly
+      // that — the consumer's `!== null` guard would instead emit NOTHING, at
+      // precisely the border R1.1 exists for.
+      //
+      // Snapshotted once, outside the loop: every window below comes from ONE
+      // report, and each `sessionUpdate` yields to the event loop, where the
+      // consumer can advance both fields. Reading them per window would let a
+      // single report's bars disagree about the context they were measured in.
+      const used = session.contextUsedTokens ?? 0;
+      const size = session.contextWindowSize;
+      for (const window of this.accountUsageTracker(session).windowsFrom(report)) {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used,
+            size,
+            _meta: { "_claude/rateLimit": window },
+          },
+        });
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: structured usage report unavailable: ${error}`);
+    }
   }
 
   private async publishGoalFromPrompt(
@@ -4199,6 +4300,21 @@ export class ClaudeAcpAgent {
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
+                // R1.2: a user turn's terminal result is the moment consumption
+                // actually changed, so refresh the account quota windows here —
+                // in the `finally`, which is the one point EVERY exit from this
+                // case passes through (refusal, cancellation, a failed turn,
+                // the plain success), so no lane ends a turn without asking.
+                // Autonomous cycles are excluded by the same gate that guards
+                // the flag above: they are background work alongside a turn,
+                // not a turn ending, and would spend one request each.
+                //
+                // Awaited, not fired and forgotten: the turn has already
+                // settled a few lines above, so the client is not kept waiting
+                // on this round-trip — only the consumer's own progression to
+                // the trailing idle is, and a stalled control request there is
+                // the same exposure `fetchContextUsedTokens` already accepts.
+                await this.publishAccountUsage(params.sessionId, session);
               }
             }
             break;
@@ -4712,6 +4828,20 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
+            // A live event is the ONLY source of a MEASURED status — the report
+            // read at the two borders can derive `allowed`/`allowed_warning`
+            // from a utilization, but never `rejected`, which means "a request
+            // was actually refused". Remember it so the derived windows that
+            // follow cannot report the same window instance as less
+            // constrained than it was measured (R1.6).
+            //
+            // Recorded OUTSIDE the emission guard below, and before it: the
+            // memory is fed by the event itself, not by our ability to forward
+            // it, and before the first assistant message of a session that
+            // guard is false. The forwarding itself is untouched (R1.8) — it
+            // still sends `rate_limit_info` verbatim, still on the same
+            // notification shape, still only when a context total exists.
+            this.accountUsageTracker(session).recordMeasured(message.rate_limit_info);
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: message.session_id,
@@ -6979,7 +7109,11 @@ export class ClaudeAcpAgent {
         )
       : hideDeprecatedModels(initializationResult.models, this.logger);
 
-    const { modelState: models, resumedContextWindow } = await getAvailableModels(
+    const {
+      modelState: models,
+      resumedContextWindow,
+      resumedContextUsedTokens,
+    } = await getAvailableModels(
       q,
       catalogModels,
       allowedModels,
@@ -7108,14 +7242,16 @@ export class ClaudeAcpAgent {
     // On session/load, the resumed session's own `getContextUsage` report — a
     // response `getAvailableModels` already awaited to learn the live model
     // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-    // authoritative and wins. Otherwise: the cached authoritative window if a
-    // prior turn has learned it for this model (`result.modelUsage`,
-    // cross-session), else the text heuristic, else the default. We
-    // deliberately do NOT issue a getContextUsage call here: on a fresh
-    // session that control request is not serviced until the first prompt
-    // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-    // (issues #886/#880). The authoritative window arrives on the first
-    // `result.modelUsage` and is cached from there.
+    // authoritative and wins. That one response also carries how much of the
+    // window is already occupied, seeded onto `contextUsedTokens` below.
+    // Otherwise: the cached authoritative window if a prior turn has learned
+    // it for this model (`result.modelUsage`, cross-session), else the text
+    // heuristic, else the default. We deliberately do NOT issue a
+    // getContextUsage call here: on a fresh session that control request is
+    // not serviced until the first prompt turn runs, so awaiting it — as
+    // 0.59.0 did — made session/new take ~15s (issues #886/#880). The
+    // authoritative window arrives on the first `result.modelUsage` and is
+    // cached from there.
     //
     // Text inference alone misses aliases that resolve to extended-context
     // models with no "1m" token anywhere in their id or description (e.g.
@@ -7174,6 +7310,13 @@ export class ClaudeAcpAgent {
       forwardSubagentText,
       contextWindowSize: seededWindow.size,
       contextWindowAuthoritative: seededWindow.authoritative,
+      // A resumed session's occupancy, from that same report. `null` means it
+      // was never read — a fresh session, or a resumed one whose model pin
+      // re-asserted (see `getAvailableModels`) — which is precisely what the
+      // field's `undefined` states, so the two map onto each other. A read
+      // zero is carried through AS zero: an empty resumed session has used
+      // nothing, and that is a measurement, not a missing one.
+      contextUsedTokens: resumedContextUsedTokens ?? undefined,
       providerCacheKey,
       taskState,
       toolUseCache: {},
@@ -7185,7 +7328,19 @@ export class ClaudeAcpAgent {
       sessionFailureState: createSessionFailureState(),
       fileChangeReportRequestIds: new Set(),
       fileChangeAuditSupport,
+      accountUsage: new AccountUsageTracker(),
     };
+
+    // R1.1: the account quota bars are born filled rather than waiting for a
+    // push that only arrives when a limit is nearly hit. Deliberately NOT
+    // awaited — for the same reason the context window above is seeded without
+    // one: on a FRESH session a control request is not serviced until the first
+    // turn runs, so awaiting it here would stall `session/new` for ~15s (issues
+    // #886/#880). R1.1 only requires the report to be asked for before the
+    // first prompt is answered, which issuing it here satisfies; the windows
+    // land whenever the response does. `publishAccountUsage` never rejects, so
+    // this cannot become an unhandled rejection.
+    void this.publishAccountUsage(sessionId, this.sessions[sessionId]);
 
     return {
       sessionId,
@@ -8066,28 +8221,47 @@ export function applyAvailableModelsAllowlist(
 /** Read the model a resumed session is actually running (via the
  *  `getContextUsage` control request — the same source `/context` prints) and
  *  map it onto the picker, along with the report's authoritative context
- *  window (`rawMaxTokens`). Resumed sessions get this request serviced before
+ *  window (`rawMaxTokens`) and the occupancy already filling it
+ *  (`totalTokens`). Resumed sessions get this request serviced before
  *  any turn runs in the new process — unlike fresh sessions, where it stalls
  *  until the first prompt turn (issues #886/#880) — so the same response that
  *  restores the live model (issue #845) also seeds the window for free,
  *  covering post-restart reloads of models the text heuristic misses (issue
- *  #596). Best-effort: a control-request failure is logged and returns nulls
+ *  #596), and the occupancy with it: a thread reloaded carrying 150k of
+ *  context otherwise reports `used: 0` until its first turn ends, and the
+ *  client assigns that number to the ring unconditionally. All three come out
+ *  of ONE response — nothing here adds a control request.
+ *  Best-effort: a control-request failure is logged and returns nulls
  *  so callers keep their current choice; failing the whole session/load over
  *  an unreadable report would be worse. */
 async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
   logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
+): Promise<{
+  model: ModelInfo | null;
+  contextWindow: number | null;
+  contextUsedTokens: number | null;
+}> {
   try {
     const usage = await query.getContextUsage();
     return {
       model: usage.model ? matchResumedModel(models, usage.model) : null,
       contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
+      // Deliberately NOT the `> 0` test the window uses: the two zeros say
+      // different things. A window of zero tokens is not a window, so 0 there
+      // can only be a report with nothing to say — but an occupancy of zero is
+      // an answer, the genuinely empty resumed session, and folding it into
+      // null would hand that session back the "absent read as 0" this seeding
+      // exists to remove. Only a value that cannot be an occupancy at all
+      // (negative, or a non-number from a response whose own declaration says
+      // it may change shape) falls back to "not read".
+      contextUsedTokens:
+        Number.isFinite(usage.totalTokens) && usage.totalTokens >= 0 ? usage.totalTokens : null,
     };
   } catch (error) {
     logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
+    return { model: null, contextWindow: null, contextUsedTokens: null };
   }
 }
 
@@ -8106,16 +8280,31 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
+): Promise<{
+  modelState: SessionModelState;
+  resumedContextWindow: number | null;
+  resumedContextUsedTokens: number | null;
+}> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
-  // The context window reported alongside a resumed session's live model.
-  // Only ever non-null on the paths where `currentModel` IS the live model
-  // (no override, or a failed override re-assert), so the window always
-  // describes the model the session actually runs.
+  // The context window reported alongside a resumed session's live model, and
+  // the occupancy already filling it. Both stay null unless the report was
+  // read, and it is read on exactly the paths where `currentModel` IS the live
+  // model (no env/settings override, or an override whose re-assert failed) —
+  // so the window always describes the model the session actually runs, and
+  // the occupancy the context that model actually carries.
+  //
+  // A resumed session whose env/settings pin re-asserts SUCCESSFULLY is
+  // therefore seeded with neither: the report was never asked for, and asking
+  // for one here purely to seed would put a second control request on the
+  // session/load path, serialized on the one channel behind the `setModel`
+  // below — the cost every seeding comment in this file is written to avoid
+  // (issues #886/#880). Such a session reports `used: 0` until its first turn
+  // ends, exactly as every resumed session did before this seeding existed.
   let resumedContextWindow: number | null = null;
+  let resumedContextUsedTokens: number | null = null;
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
@@ -8147,6 +8336,7 @@ async function getAvailableModels(
     const live = await readResumedLiveModel(query, models, logger);
     currentModel = live.model ?? currentModel;
     resumedContextWindow = live.contextWindow;
+    resumedContextUsedTokens = live.contextUsedTokens;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
@@ -8182,6 +8372,7 @@ async function getAvailableModels(
       const live = await readResumedLiveModel(query, models, logger);
       currentModel = live.model ?? currentModel;
       resumedContextWindow = live.contextWindow;
+      resumedContextUsedTokens = live.contextUsedTokens;
     }
   }
 
@@ -8199,6 +8390,7 @@ async function getAvailableModels(
       currentModelId: currentModel.value,
     },
     resumedContextWindow,
+    resumedContextUsedTokens,
   };
 }
 
