@@ -78,7 +78,7 @@ describe("a status is derived, and never invented as rejected (R1.6)", () => {
     expect(deriveStatus(1)).toBe("allowed_warning");
   });
 
-  it("derives rejected from no input at all", () => {
+  it("never derives rejected, from any input at all", () => {
     // `rejected` means a request was refused. Nothing in a utilization report
     // says that, so no input may produce it: emitting it would be a claim, not
     // a derivation, and it outranks every other status in `most_constrained`.
