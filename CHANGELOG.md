@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.10.1...v0.11.0) (2026-09-05)
+
+
+### Features
+
+* **usage:** report every quota window from the structured usage report ([#82](https://github.com/lucascouts/claude-agent-acp-plus/issues/82)) ([0ae5149](https://github.com/lucascouts/claude-agent-acp-plus/commit/0ae51496692f81f75a65a4a01a6ed6f57f26b2d2))
+
 ## [0.10.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.10.0...v0.10.1) (2026-09-02)
 
 
