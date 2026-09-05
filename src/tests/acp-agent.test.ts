@@ -8503,20 +8503,39 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual([]);
   });
 
-  it("does not forward the result text of a turn that only emitted status text", async () => {
+  it("does not forward the result text of a turn that only emitted compaction output", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // `/compact` carries no echo, so it is promoted at its own result, and its
-    // status text is emitted directly rather than through the forwarding loops.
-    // That text still counts as delivered, so the result must not follow it.
+    // synthetic tool call is emitted directly rather than through the assistant
+    // forwarding loops. It still counts as visible output, so the result must
+    // not expose the generated summary afterward — the property the deleted
+    // "Compacting..." banner used to provide by counting as delivered text.
     injectSession(agent, [
-      { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
       replayedResult("conversation summarized"),
       idle,
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
 
-    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "compact-start",
+      title: "Compact conversation",
+      kind: "think",
+      status: "in_progress",
+      _meta: {
+        contextCompaction: { version: 1 },
+        claudeCode: { toolName: "compact" },
+      },
+    });
   });
 
   // Like injectSession, but serves two prompts: each turn's echo is yielded

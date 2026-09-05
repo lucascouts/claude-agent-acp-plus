@@ -120,6 +120,11 @@ import {
 import { agentName } from "./agent-name.js";
 import { filterDeprecatedModels } from "./model-deprecation.js";
 import { SettingsManager } from "./settings.js";
+import { ContextCompactionMetadata } from "./context-compaction-meta.js";
+import {
+  ContextCompactionLifecycle,
+  contextCompactionMetadataFromBoundary,
+} from "./context-compaction.js";
 import {
   createThinkingConfigOption,
   effectiveThinkingConfig,
@@ -199,6 +204,7 @@ import {
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { AccountUsageTracker } from "./account-usage.js";
+import { isUsageCommandText, structuredUsageMarkdown } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -369,6 +375,26 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Set when this turn's prompt is exactly `/usage` (story 011, R2.3). The
+   *  command still runs through the normal SDK turn — ordering, cancellation,
+   *  persistence and replay are untouched — and the structured render is only
+   *  an overlay on the output it produces. */
+  isUsageCommand?: boolean;
+  /** The in-flight structured render for this turn, started once and awaited by
+   *  whichever message shape carries the command's output. Resolves to null on
+   *  each of R2.4's three ways out, which means "forward Claude Code's own
+   *  text, unchanged". */
+  usageMarkdown?: Promise<string | null>;
+  /** Abandons {@link usageMarkdown} when the turn ends. Half of the bound D5
+   *  asks for: the timeout covers a request that is never serviced, this covers
+   *  a request whose turn is already over. */
+  usageMarkdownAbort?: AbortController;
+  /** Set once the render has been published, so the SAME output arriving again
+   *  through a second message shape is not rendered twice. */
+  usageMarkdownDelivered?: boolean;
+  /** The original text the published render replaced — how a duplicate mirror
+   *  of that frame is told from a later, genuinely different one. */
+  usageOriginalOutput?: string;
   /** Optional hidden, model-authored file-change audit requested by the ACP
    *  client for this turn. The state is turn-owned so a late tool call can
    *  never be rebound to a newer prompt. */
@@ -1052,6 +1078,10 @@ type ProviderConfig = {
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  /* Versioned facts about a context compaction, on the synthetic tool call
+     that reports one. See context-compaction-meta.ts for why this rides in
+     `_meta` rather than ACP's own `compaction_update` variant. */
+  contextCompaction?: ContextCompactionMetadata;
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
@@ -2090,6 +2120,14 @@ export class ClaudeAcpAgent {
       fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
     }
 
+    // R2.3: exactly `/usage`, and nothing else in the prompt. A second block
+    // (an attached file, a second text part) is a model turn that happens to
+    // mention the command, not the local command itself.
+    const isUsageCommand =
+      params.prompt.length === 1 &&
+      params.prompt[0]?.type === "text" &&
+      isUsageCommandText(params.prompt[0].text);
+
     session.titles.onPrompt(params.prompt);
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
@@ -2099,6 +2137,9 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
+      ...(isUsageCommand
+        ? { isUsageCommand: true, usageMarkdownAbort: new AbortController() }
+        : {}),
       ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
       resolve: () => {},
@@ -2417,11 +2458,6 @@ export class ClaudeAcpAgent {
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
-    // Tracks whether we're inside a compaction. The SDK emits the terminal
-    // `status` (compact_result success/failed) twice for a single failed
-    // compaction, and the two messages are indistinguishable — so we report the
-    // outcome only while a compaction is in progress, then clear this.
-    let compactionInProgress = false;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -2456,6 +2492,12 @@ export class ClaudeAcpAgent {
      *  recognizable by the `parentToolUseId` meta that toAcpNotifications
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
+    /** Compaction as one ACP tool lifecycle, replacing the in-progress boolean
+     *  this consumer used to infer it from (story 010, R2.1/R2.2). Declared
+     *  ahead of `sendUpdate` because that chokepoint consults it; the closure
+     *  below only dereferences `sendUpdate` when an update is actually sent,
+     *  which is always after both bindings exist. */
+    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
     const sendUpdate = async (notification: SessionNotification) => {
       const { update } = notification;
       if (
@@ -2471,6 +2513,16 @@ export class ClaudeAcpAgent {
       if (update.sessionUpdate === "agent_message_chunk") {
         const claudeMeta = update._meta?.claudeCode as
           { parentToolUseId?: string | null } | undefined;
+        // A failed manual compaction's error also arrives as assistant text;
+        // the tool lifecycle already carried it, so drop that one copy rather
+        // than report the same failure twice (R2.2).
+        if (
+          !claudeMeta?.parentToolUseId &&
+          update.content.type === "text" &&
+          compaction.consumeDuplicateErrorOutput(update.content.text)
+        ) {
+          return;
+        }
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
           session.titles.onAssistantText(update.content);
@@ -2550,7 +2602,6 @@ export class ClaudeAcpAgent {
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
-      compactionInProgress = false;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -2569,6 +2620,27 @@ export class ClaudeAcpAgent {
       if (session.activeTurn) session.activeTurn.carriedUsage = undefined;
     };
 
+    /** Start this turn's structured `/usage` render, once, and hand back the
+     *  in-flight promise; undefined when the turn owns no render.
+     *
+     *  Started at ACTIVATION rather than when the output arrives, so the
+     *  bounded wait overlaps the command instead of following it: by the time
+     *  the CLI has printed its answer the report has usually already lost or
+     *  won its race, and the user waits for neither. */
+    const ensureUsageMarkdown = (turn: Turn): Promise<string | null> | undefined => {
+      if (!turn.isUsageCommand || !turn.usageMarkdownAbort) {
+        return undefined;
+      }
+      // `session.query` is read here rather than captured: a provider switch
+      // can replace it, and the render must ask the query that is live now.
+      turn.usageMarkdown ??= structuredUsageMarkdown(
+        session.query,
+        turn.usageMarkdownAbort.signal,
+        this.logger,
+      );
+      return turn.usageMarkdown;
+    };
+
     /** Promote a queued turn to active: it becomes the one output is attributed
      *  to, and its scratch starts fresh. Clears the cancelled flag so a turn
      *  enqueued after a prior cancel isn't treated as cancelled. Also clears any
@@ -2580,6 +2652,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      ensureUsageMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -2741,6 +2814,52 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Claim the structured render for whichever turn is producing this local
+     *  command output. Three answers, and the caller must distinguish all
+     *  three:
+     *
+     *    undefined — not a `/usage` turn, or one of R2.4's three ways out
+     *                fired: publish `originalOutput` unchanged
+     *    string    — the render: publish it INSTEAD of `originalOutput`
+     *    null      — publish nothing (a duplicate of an already-replaced
+     *                frame, or a turn cancelled during the wait)
+     *
+     *  No content signature and no text parsing: which turn owns a render was
+     *  decided from the prompt, so a command whose output happens to look like
+     *  `/usage`'s can never be rewritten. */
+    const takeUsageMarkdown = async (
+      originalOutput: string,
+    ): Promise<string | null | undefined> => {
+      const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
+      if (!turn) {
+        return undefined;
+      }
+      const pending = ensureUsageMarkdown(turn);
+      if (!pending) {
+        return undefined;
+      }
+      const markdown = await pending;
+      // That await can span the whole bounded wait, and a cancel landing inside
+      // it ends the turn. A cancelled turn publishes nothing — not the render,
+      // and not the original text either.
+      if (session.cancelled) {
+        return null;
+      }
+      if (markdown === null) {
+        return undefined;
+      }
+      if (turn.usageMarkdownDelivered) {
+        // One local command can reach the client through more than one SDK
+        // message shape. Suppress an exact mirror of the frame already
+        // replaced, but let a later, genuinely different frame (an
+        // interruption diagnostic, say) take the normal path.
+        return turn.usageOriginalOutput === originalOutput ? null : undefined;
+      }
+      turn.usageMarkdownDelivered = true;
+      turn.usageOriginalOutput = originalOutput;
+      return markdown;
+    };
+
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
@@ -2816,6 +2935,9 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
+      // The turn is over: abandon any structured `/usage` render still in
+      // flight rather than leaving it to run out its own clock (D5).
+      turn.usageMarkdownAbort?.abort();
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -2851,6 +2973,7 @@ export class ClaudeAcpAgent {
       }
       this.finishFileChangeAudit(session, turn, "providerError");
       turn.settled = true;
+      turn.usageMarkdownAbort?.abort();
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
       streamedToolInputs.clear();
@@ -2910,6 +3033,7 @@ export class ClaudeAcpAgent {
           this.finishFileChangeAudit(session, turn, "providerError");
           const wasHeld = isHeldOpen(turn);
           turn.settled = true;
+          turn.usageMarkdownAbort?.abort();
           if (wasHeld) {
             // A held turn's answer already streamed and its outcome is
             // recorded — a stream death during the post-answer hold is a
@@ -3260,48 +3384,47 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
+                // Compaction is reported as ONE tool lifecycle rather than the
+                // assistant-text banners this branch used to emit (R2.1). The
+                // banners needed a boolean in-progress guard because the SDK
+                // repeats the terminal `status` and the two copies are
+                // indistinguishable here; the lifecycle owns that de-duplication
+                // by phase instead, so the guard is gone rather than inert (R2.2).
+                //
+                // The SDK signals manual `/compact` completion with a status
+                // message carrying `compact_result`, not the `compact_boundary`
+                // message (which only fires when there's content to compact) —
+                // so both frames must be able to close a lifecycle.
                 if (message.status === "compacting") {
-                  compactionInProgress = true;
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
-                } else if (message.compact_result === "success" && compactionInProgress) {
-                  // The SDK signals manual `/compact` completion with a status
-                  // message carrying `compact_result`, not the `compact_boundary`
-                  // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
-                    },
-                  });
-                } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
-                    },
+                  await compaction.start(message.session_id, message.uuid);
+                } else if (message.compact_result === "success") {
+                  await compaction.finish(message.session_id, message.uuid, "completed");
+                } else if (message.compact_result === "failed") {
+                  await compaction.finish(message.session_id, message.uuid, "failed", {
+                    ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
                 break;
               }
               case "compact_boundary": {
+                // This is the only frame carrying the token counts, and it
+                // arrives AFTER the terminal `status` — so it enriches the
+                // lifecycle rather than reporting an outcome again
+                // (`enrichTerminal`): the update omits `status`, leaving exactly
+                // one terminal transition the client can see (R2.2). It also
+                // stands alone when no `status` preceded it (an automatic
+                // compaction, or a replay that dropped the opening frame).
+                const compactMetadata = message.compact_metadata;
+                await compaction.finish(
+                  message.session_id,
+                  message.uuid,
+                  "completed",
+                  compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
+                  true,
+                );
                 // Refresh the displayed usage immediately so the client doesn't
                 // keep showing the stale pre-compaction size (e.g. "944k/1m")
-                // right after the user sees "Compacting completed", which is
+                // right after the compaction tool call completes, which is
                 // confusing and wrong.
                 //
                 // Prefer the SDK's authoritative post-compaction `used` via
@@ -3316,10 +3439,6 @@ export class ClaudeAcpAgent {
                 // `size` keeps coming from session.contextWindowSize —
                 // compaction frees occupancy, it doesn't change the model's
                 // window.
-                //
-                // The "Compacting completed." text is emitted from the `status`
-                // handler (keyed on `compact_result`), not here, so the failure
-                // path gets a message too.
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
@@ -3335,11 +3454,24 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                // A failed `/compact` also prints its error here; the tool
+                // lifecycle already carried it, so consume that one duplicate
+                // (matched by text, once) without hiding other command output.
+                if (compaction.consumeDuplicateErrorOutput(message.content)) {
+                  break;
+                }
+                // R2.3/R2.4: a `/usage` turn publishes its structured render
+                // here instead; anything else, and any way out, publishes the
+                // CLI's own text byte-for-byte.
+                const usageMarkdown = await takeUsageMarkdown(message.content);
+                if (usageMarkdown === null) {
+                  break;
+                }
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
+                    content: { type: "text", text: usageMarkdown ?? message.content },
                   },
                 });
                 break;
@@ -3377,6 +3509,10 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
+                    // An interrupt can pre-empt the result entirely, so the
+                    // lifecycle's own reset there never ran; close it here or a
+                    // half-open compaction would leak into the next turn.
+                    compaction.reset();
                     settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
@@ -3437,6 +3573,9 @@ export class ClaudeAcpAgent {
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
+                    // Same reason as the cancelled branch: this turn will never
+                    // reach the result that would have reset the lifecycle.
+                    compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -3919,6 +4058,12 @@ export class ClaudeAcpAgent {
               // through the early break below, which the gated `finally`
               // leaves alone).
               const deliveredAssistantText = session.emittedAssistantText;
+              // The deleted "Compacting…" banners counted as delivered text
+              // simply by going through sendUpdate; tool calls don't, so a turn
+              // that ONLY compacted (e.g. `/compact`, promoted at its own
+              // result) needs this to keep its result text from being re-emitted
+              // by the issue-#453 fallback below.
+              const deliveredCompactionOutput = compaction.hasDeliveredOutput;
 
               // Every user-turn result terminates a turn (settle, reject, or
               // orphan skip) and the SDK follows it with a trailing
@@ -4208,12 +4353,21 @@ export class ClaudeAcpAgent {
                   // the fallback there. (Autonomous results never get here —
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
-                  if (
+                  const shouldForwardResult =
                     session.activeTurn?.isLocalOnlyCommand ||
-                    (!deliveredAssistantText && (message.usage.output_tokens ?? 0) === 0)
-                  ) {
+                    (!deliveredAssistantText &&
+                      !deliveredCompactionOutput &&
+                      (message.usage.output_tokens ?? 0) === 0);
+                  if (shouldForwardResult) {
+                    // A `/usage` turn whose output arrives only on the result.
+                    // Claiming it here also stops the raw text following a
+                    // render already published from another message shape.
+                    const usageMarkdown = await takeUsageMarkdown(message.result);
+                    if (usageMarkdown === null) {
+                      break;
+                    }
                     for (const notification of toAcpNotifications(
-                      message.result,
+                      usageMarkdown ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -4321,6 +4475,11 @@ export class ClaudeAcpAgent {
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
+                // A result closes this turn's compaction lifecycle. Reset here
+                // rather than at idle: an owed idle from this turn can arrive
+                // after the next turn has already started, and would erase that
+                // turn's compaction state instead of its own.
+                compaction.reset();
                 // R1.2: a user turn's terminal result is the moment consumption
                 // actually changed, so refresh the account quota windows here —
                 // in the `finally`, which is the one point EVERY exit from this
@@ -4341,6 +4500,18 @@ export class ClaudeAcpAgent {
             break;
           }
           case "stream_event": {
+            // Compaction streams as its own block type. The deltas carry the
+            // generated summary, which stays internal to the agent — all the
+            // client gets is one keep-alive on the open tool call, so a long
+            // compaction doesn't look stalled.
+            const isCompactionProgress =
+              (message.event.type === "content_block_start" &&
+                message.event.content_block.type === "compaction") ||
+              (message.event.type === "content_block_delta" &&
+                message.event.delta.type === "compaction_delta");
+            if (isCompactionProgress) {
+              await compaction.heartbeat(message.session_id, message.uuid);
+            }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
             // it) can all be tagged with the same, replay-stable id.
@@ -4580,6 +4751,21 @@ export class ClaudeAcpAgent {
               break;
             }
 
+            // Synthetic assistant frames carry the CLI's local-command output.
+            // On resume the SDK can replay a stale frame from an earlier compact
+            // attempt after a later compaction completed. Scope the suppression
+            // to the compaction lifecycle and the synthetic frame itself rather
+            // than to the owning turn: one model turn may compact more than
+            // once, and its real assistant response must still be delivered.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>" &&
+              compaction.hasDeliveredOutput
+            ) {
+              break;
+            }
+
             // Snapshot the latest top-level assistant usage and model so the
             // next `result` can emit a usage_update tied to the right context
             // window. Subagent messages are excluded to keep the snapshot
@@ -4621,8 +4807,14 @@ export class ClaudeAcpAgent {
             ) {
               const stripped = stripLocalCommandMetadata(message.message.content);
               if (typeof stripped === "string") {
+                // The usual shape for a real `/usage`: the comment above names
+                // it as one of the commands the CLI wraps in these markers.
+                const usageMarkdown = await takeUsageMarkdown(stripped);
+                if (usageMarkdown === null) {
+                  break;
+                }
                 for (const notification of toAcpNotifications(
-                  stripped,
+                  usageMarkdown ?? stripped,
                   message.message.role,
                   params.sessionId,
                   session.toolUseCache,
@@ -5009,6 +5201,11 @@ export class ClaudeAcpAgent {
       await session.queryRecreateInFlight;
     }
     session.cancelled = true;
+    // Every turn's structured `/usage` render is abandoned here — the queue
+    // still holds the active turn at this point, so one sweep covers both.
+    for (const turn of session.turnQueue ?? []) {
+      turn.usageMarkdownAbort?.abort();
+    }
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
