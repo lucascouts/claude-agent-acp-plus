@@ -204,6 +204,16 @@ import {
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { AccountUsageTracker } from "./account-usage.js";
+import {
+  ACCOUNT_CONFIG_ID,
+  accountForValue,
+  accountInForce,
+  type AccountOptionState,
+  createAccountConfigOption,
+  type DeclaredAccount,
+  envForAccount,
+  readDeclaredAccounts,
+} from "./accounts.js";
 import { isUsageCommandText, structuredUsageMarkdown } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -633,6 +643,25 @@ export type Session = {
    *  resolved when the session is created, and re-reading them on a hot path
    *  would imply they can change under it. */
   workflowsDisabled: boolean;
+  /** The accounts declared in this session's resolved settings (D4), read once
+   *  at initialize and held for the same reason `workflowsDisabled` is. Empty
+   *  when none are declared, in which case no selector is advertised and the
+   *  process's own configuration home stands. Optional because a Session
+   *  assembled without it (a fixture, a future construction site) has declared
+   *  no accounts, which is exactly what absent means here. */
+  declaredAccounts?: DeclaredAccount[];
+  /** The account selector's value in force for this session, or `undefined`
+   *  when nothing is declared. Rebuilt into the option on every
+   *  `buildConfigOptions` pass so the row survives a model switch. */
+  currentAccount?: string;
+  /** The environment overlay the account in force resolves to — one variable,
+   *  `CLAUDE_CONFIG_DIR` (D2). Set when the session is created, and again when
+   *  the selector changes, where it records what a session created FROM NOW ON
+   *  will be started with. It is NOT applied to the query already running: the
+   *  live query's env is baked into `queryOptions`, which a lazy recreate
+   *  rebuilds from, so a selection cannot move the thread on screen onto
+   *  another account's history (D7). */
+  accountEnv?: Record<string, string>;
   /** Why the SDK currently can't serve Fast mode, when the reason is one worth
    *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
    *  routine states like the SDK's own opt-in requirement normalize to
@@ -1530,6 +1559,14 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /** The account selector's last choice, as a selector value (see
+   *  `accounts.ts`). Held on the AGENT, not on a session, because that is what
+   *  it governs: the account applies to sessions created after it is set, and
+   *  the thread that was on screen when the user chose keeps the account it
+   *  started under (D7 — a session id belongs to one account's local history,
+   *  so a live thread cannot be carried across a switch). `undefined` until a
+   *  selection is made, in which case the first declared account stands. */
+  private selectedAccount?: string;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -6418,6 +6455,15 @@ export class ClaudeAcpAgent {
           ),
           enabled: session.ultracode,
         },
+        {
+          disableWorkflows: session.workflowsDisabled,
+          // Threaded for the same reason Thinking is (R1.7): an option not
+          // passed through this rebuild silently drops from the picker on
+          // every model switch. The account is model-independent, so the row
+          // and its selection survive unchanged.
+          accounts: session.declaredAccounts,
+          currentAccount: session.currentAccount,
+        },
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -6448,6 +6494,27 @@ export class ClaudeAcpAgent {
         agent: value === DEFAULT_AGENT_ID ? null : value,
       });
       session.currentAgent = value;
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+    } else if (configId === ACCOUNT_CONFIG_ID) {
+      // Resolve BEFORE recording anything: an account nobody declared must
+      // leave the session exactly as it was. `setSessionConfigOption`'s shared
+      // validation already refuses a value that is not among the option's
+      // entries; this second check covers the one path that bypasses it (a
+      // client round-tripping `currentValue`) and keeps the refusal here
+      // rather than in a caller (R6.3).
+      const account = accountForValue(session.declaredAccounts ?? [], value);
+      if (!account) {
+        throw new Error(`Invalid value for config option ${configId}: ${value}`);
+      }
+      // No SDK call, and no query recreate: the account is applied through the
+      // per-session `env` at query CREATION (D2/D9 — the SDK already accepts
+      // one, so no Zed patch is involved), and this session's query keeps the
+      // account it was created under (D7).
+      this.selectedAccount = value;
+      session.currentAccount = value;
+      session.accountEnv = envForAccount(account);
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -7168,9 +7235,28 @@ export class ClaudeAcpAgent {
         env: { ...baseSettings?.env, ...providerEnv },
       };
     }
+    // The account this session runs under (R6.3): the selector's last choice
+    // when it names a declared account, else the first declared one. Read from
+    // the resolved settings, because accounts are DECLARED, never discovered
+    // (D4) — nothing here scans a home directory for credential stores. With
+    // none declared there is no overlay and the process's own configuration
+    // home stands, which is exactly the behavior that predates this option.
+    const declaredAccounts = readDeclaredAccounts(settingsManager.getSettings(), this.logger);
+    const accountEntry = accountInForce(declaredAccounts, this.selectedAccount);
+    // The SESSION's account home, never the ADAPTER's (D3): this overlay is
+    // handed to the SDK per session and to nothing else. `process.env` is not
+    // mutated — `CLAUDE_CONFIG_DIR` is read once into a module-level constant
+    // that `settings.ts` uses to find the adapter's OWN settings.json, so a
+    // mutation would be seen by some readers and not others.
+    const accountEnv = accountEntry ? envForAccount(accountEntry.account) : undefined;
     const env = {
       ...process.env,
       ...userProvidedOptions?.env,
+      // After the client-supplied env: the selector is a live user choice,
+      // and an agent entry that pinned CLAUDE_CONFIG_DIR is precisely the
+      // "account as a second agent" shape this option replaces (D1). Before
+      // the provider routing, which sets ANTHROPIC_* and never this key.
+      ...accountEnv,
       // Client-managed LLM routing: `providers/set` config wins, else the
       // legacy gateway auth request. Routing is baked into the query at
       // creation; provider updates recreate loaded queries between turns.
@@ -7509,6 +7595,14 @@ export class ClaudeAcpAgent {
         ),
         enabled: settingsManager.getSettings().ultracode === true,
       },
+      {
+        disableWorkflows: workflowsDisabled,
+        // Both halves of the selector, resolved above alongside the env they
+        // produced — so the row the client renders and the configuration
+        // directory the query was actually started with cannot disagree.
+        accounts: declaredAccounts,
+        currentAccount: accountEntry?.value,
+      },
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -7593,6 +7687,9 @@ export class ClaudeAcpAgent {
       currentAgent,
       ultracode: initialUltracode,
       workflowsDisabled,
+      declaredAccounts,
+      currentAccount: accountEntry?.value,
+      accountEnv,
       fastModeEnabled,
       fastModeDisabledReason,
       abortController,
@@ -8037,9 +8134,13 @@ export function buildConfigOptions(
    *  direct callers/tests, in which case availability is derived from
    *  `settings` and the entry renders unselected. */
   ultracode?: UltracodeOptionState,
-  /** Resolved session settings, read only for `disableWorkflows` — the half of
-   *  the Ultracode gate that is not a model capability. */
-  settings?: Pick<Settings, "disableWorkflows">,
+  /** Resolved session settings, read for `disableWorkflows` — the half of the
+   *  Ultracode gate that is not a model capability — and, alongside them, the
+   *  declared accounts plus the one in force, which decide whether an account
+   *  selector is advertised at all (R6.1/R6.2). `accounts` is not a field of
+   *  the SDK's `Settings`, so it is carried beside them rather than picked
+   *  from them. */
+  settings?: Pick<Settings, "disableWorkflows"> & AccountOptionState,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     SessionModeManager.configOption(modes),
@@ -8162,6 +8263,19 @@ export function buildConfigOptions(
         })),
       ],
     });
+  }
+
+  // The account selector, last because it is the least often touched of the
+  // rows and the only one that governs the NEXT thread rather than this one.
+  // `createAccountConfigOption` returns undefined below two declared accounts,
+  // so the row is genuinely absent there rather than present and empty (D8,
+  // R6.2).
+  const accountOption = createAccountConfigOption(
+    settings?.accounts ?? [],
+    settings?.currentAccount,
+  );
+  if (accountOption) {
+    options.push(accountOption);
   }
 
   return options;
