@@ -2691,12 +2691,20 @@ export class ClaudeAcpAgent {
      *
      *  But an echo-less result can also be an ORPHAN: cancel() settles+removes a
      *  queued turn whose user message was already pushed, so the SDK still runs
-     *  it and emits a result with no uuid to match. Promoting the head for an
+     *  it and emits a result with no echo to match. Promoting the head for an
      *  orphan would misattribute its stop reason/usage to an unrelated later
      *  prompt. `session.pendingOrphanResults` counts exactly how many such
      *  orphans are still expected (FIFO, they arrive before any live turn's
-     *  result), so we skip those and only promote once the count is drained. */
-    const ensureActiveTurn = () => {
+     *  result), so we skip those and only promote once the count is drained.
+     *
+     *  `resultUserMessageUuid` is the result's own join key (SDK 0.3.246+
+     *  echoes the triggering send's client uuid on results; absent on older
+     *  CLIs, synthetic/meta turns, and session-scoped failures). When present
+     *  it upgrades the map lane from positional heuristics to an exact match:
+     *  a stamp naming an orphaned command consumes the result outright, and a
+     *  stamp naming anything else positively refutes "this is a dead turn's
+     *  result", so the dup-over-loss one-skip must not eat it. */
+    const ensureActiveTurn = (resultUserMessageUuid?: string) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -2748,8 +2756,20 @@ export class ClaudeAcpAgent {
       // double-consume it. The unexpected-transition logging in the frame
       // handler is the tripwire for that class of drift.
       if (session.orphanCommands?.size) {
+        // Resolved BEFORE the drain below, which deletes every started/zombie
+        // entry: a stamp naming a "started" orphan would no longer be found
+        // afterwards, and the result would promote the head — misattributing
+        // a dead turn's outcome to a live prompt, the exact failure the map
+        // exists to prevent. The lookup order is load-bearing.
+        const stampedOrphanUuid =
+          resultUserMessageUuid !== undefined && session.orphanCommands.has(resultUserMessageUuid)
+            ? resultUserMessageUuid
+            : undefined;
         let consumedOrphanResult = false;
         let oldestPending: string | undefined;
+        // The started/zombie drain applies regardless of the stamp: commands
+        // folded into the turn that emitted this result share it, and zombies'
+        // late results have already passed (or never existed).
         for (const [uuid, state] of session.orphanCommands) {
           if (state === "started" || state === "zombie") {
             consumedOrphanResult = true;
@@ -2758,17 +2778,32 @@ export class ClaudeAcpAgent {
             oldestPending ??= uuid;
           }
         }
-        if (consumedOrphanResult) {
+        if (stampedOrphanUuid !== undefined) {
+          // Exact join: the result names an orphaned command. Delete the
+          // matched entry even when it is still "pending" (its dispatch frame
+          // was lost) and consume the result — no promotion.
+          session.orphanCommands.delete(stampedOrphanUuid);
           return;
         }
-        if (oldestPending !== undefined) {
-          // No dispatch was seen before this result, so it is very likely a
-          // live turn's — but a lost "started" frame would mean it IS the
-          // orphan's (dup-over-loss: prefer one wrong skip over
-          // misattributing a dead turn's outcome to a live prompt). Grant
-          // each pending entry exactly one skip, like the count lane did.
-          session.orphanCommands.delete(oldestPending);
-          return;
+        if (resultUserMessageUuid !== undefined) {
+          // The stamp names a send that is NOT in the orphan map, so this is
+          // a live turn's result: skip both the consumed-return (its folded
+          // orphans were drained above, but the result itself still needs a
+          // turn) and the dup-over-loss one-skip the stamp refutes, and fall
+          // through to promote the head.
+        } else {
+          if (consumedOrphanResult) {
+            return;
+          }
+          if (oldestPending !== undefined) {
+            // No dispatch was seen before this result, so it is very likely a
+            // live turn's — but a lost "started" frame would mean it IS the
+            // orphan's (dup-over-loss: prefer one wrong skip over
+            // misattributing a dead turn's outcome to a live prompt). Grant
+            // each pending entry exactly one skip, like the count lane did.
+            session.orphanCommands.delete(oldestPending);
+            return;
+          }
         }
       }
       const head = firstUnsettledQueuedTurn();
@@ -4025,7 +4060,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                ensureActiveTurn();
+                ensureActiveTurn(message.user_message_uuid);
                 // Once the submitted goal command has produced its own result,
                 // no older runtime update can still precede it in the ordered
                 // SDK stream. Stop suppressing updates even when this runtime
@@ -5248,8 +5283,10 @@ export class ClaudeAcpAgent {
       }
       // Each removed queued turn's user message was already pushed to the SDK,
       // which processes input FIFO and will still emit a result for it with no
-      // uuid to match. Track those so the consumer skips them (see
-      // ensureActiveTurn) rather than misattributing them to the head.
+      // user echo to match (0.3.246+ CLIs do stamp results with the
+      // triggering send's user_message_uuid, which ensureActiveTurn uses as
+      // an exact join when present). Track those so the consumer skips them
+      // (see ensureActiveTurn) rather than misattributing them to the head.
       // msg_lifecycle_v1 CLIs get per-uuid tracking drained by the command's
       // own terminal lifecycle frame — exact under command coalescing, where
       // N queued commands fold into ONE turn emitting one result and a plain
