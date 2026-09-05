@@ -58,7 +58,6 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
-  EffortLevel,
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
@@ -79,6 +78,7 @@ import {
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
+  Settings,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -126,6 +126,15 @@ import {
   resolveThinkingSelection,
   THINKING_CONFIG_ID,
 } from "./thinking-option.js";
+import {
+  effortOptionValue,
+  isUltracodeAvailable,
+  isUltracodeValue,
+  ULTRACODE_OPTION_NAME,
+  ULTRACODE_OPTION_VALUE,
+  ultracodeFlagSettings,
+  UltracodeOptionState,
+} from "./ultracode.js";
 import { handleRewindCommand, parseRewindInvocation, RewindDeps } from "./rewind-command.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
@@ -586,6 +595,18 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Whether Ultracode is the session's current effort selection. Tracked as
+   *  intent for the same reason `fastModeEnabled` is: the entry disappears from
+   *  the picker on a model without `xhigh`, and reappears selected when a model
+   *  that has it is chosen again. It is NOT derivable from the effort level —
+   *  `xhigh` on its own is a legitimate selection that is not Ultracode. */
+  ultracode: boolean;
+  /** Whether this session's resolved settings disable workflows — the half of
+   *  the Ultracode gate that is not a model capability. Read once at
+   *  initialize and held, rather than re-read per model switch: settings are
+   *  resolved when the session is created, and re-reading them on a hot path
+   *  would imply they can change under it. */
+  workflowsDisabled: boolean;
   /** Why the SDK currently can't serve Fast mode, when the reason is one worth
    *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
    *  routine states like the SDK's own opt-in requirement normalize to
@@ -6152,6 +6173,17 @@ export class ClaudeAcpAgent {
         session.thinkingEnabled ??
           effectiveThinkingConfig(undefined, process.env.MAX_THINKING_TOKENS, this.logger) !==
             undefined,
+        {
+          // The new model decides whether the entry renders at all; the session's
+          // retained intent decides whether it renders selected. A model without
+          // `xhigh` drops the entry, and `validEffort` then falls back for it the
+          // same way it does for any unsupported level.
+          available: isUltracodeAvailable(
+            newModelInfo?.supportsEffort ? (newModelInfo.supportedEffortLevels ?? []) : [],
+            { disableWorkflows: session.workflowsDisabled },
+          ),
+          enabled: session.ultracode,
+        },
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -6159,9 +6191,8 @@ export class ClaudeAcpAgent {
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(newEffort),
-        });
+        await session.query.applyFlagSettings(ultracodeFlagSettings(newEffort));
+        session.ultracode = isUltracodeValue(newEffort);
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -6191,9 +6222,11 @@ export class ClaudeAcpAgent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
       if (configId === EFFORT_CONFIG_ID) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
+        // Both keys, always. Selecting a plain level after Ultracode must CLEAR
+        // the flag, and only an explicit `null` clears it — see
+        // `ultracodeFlagSettings`.
+        await session.query.applyFlagSettings(ultracodeFlagSettings(value));
+        session.ultracode = isUltracodeValue(value);
       }
     }
   }
@@ -6377,12 +6410,18 @@ export class ClaudeAcpAgent {
         // read post-init, so a setter update that landed during the init
         // await is already included.
         const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-        const effortLevel =
-          typeof effortOpt?.currentValue === "string"
-            ? toSdkEffortLevel(effortOpt.currentValue)
-            : null;
+        const effortValue =
+          typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+        const { effortLevel, ultracode } = ultracodeFlagSettings(effortValue);
+        // Only the positive case is re-applied: the replacement's flag layer
+        // starts empty, so clearing a key that was never set would be a control
+        // request that says nothing. `ultracode` is sent WITH its level rather
+        // than alone — the SDK requires an xhigh-capable model for it, and a
+        // flag layer carrying one half of the pair is a state no picker names.
         if (effortLevel !== null) {
-          await replacement.applyFlagSettings({ effortLevel });
+          await replacement.applyFlagSettings(
+            ultracode === true ? { effortLevel, ultracode: true } : { effortLevel },
+          );
         }
         const supportsFastMode =
           session.modelInfos.find((m) => m.value === session.models.currentModelId)
@@ -7205,6 +7244,7 @@ export class ClaudeAcpAgent {
       disabledReason: fastModeDisabledReason,
     };
 
+    const workflowsDisabled = settingsManager.getSettings().disableWorkflows === true;
     const configOptions = buildConfigOptions(
       modes,
       models,
@@ -7225,18 +7265,32 @@ export class ClaudeAcpAgent {
       // reusing it avoids re-parsing (and re-logging an invalid) env var —
       // exactly one error log per query creation.
       thinking !== undefined,
+      {
+        // Seeded from settings, not inferred from the level: `Settings.ultracode`
+        // is what the user (or a `--settings` payload) actually asked for, while
+        // `xhigh` on its own is a legitimate selection that is not Ultracode.
+        available: isUltracodeAvailable(
+          currentModelInfo?.supportsEffort ? (currentModelInfo.supportedEffortLevels ?? []) : [],
+          { disableWorkflows: workflowsDisabled },
+        ),
+        enabled: settingsManager.getSettings().ultracode === true,
+      },
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
     const initialEffort = configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
+    // The picker's resolved value, not the raw setting: `buildConfigOptions`
+    // has already dropped Ultracode if this model cannot reach `xhigh`, and the
+    // session must track what is displayed rather than what was requested.
+    const initialUltracode =
+      typeof initialEffort?.currentValue === "string" &&
+      isUltracodeValue(initialEffort.currentValue);
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
       initialEffort.currentValue !== "default"
     ) {
-      await q.applyFlagSettings({
-        effortLevel: toSdkEffortLevel(initialEffort.currentValue),
-      });
+      await q.applyFlagSettings(ultracodeFlagSettings(initialEffort.currentValue));
     }
     // Seed the context window WITHOUT any extra IPC on the session/new path.
     // On session/load, the resumed session's own `getContextUsage` report — a
@@ -7303,6 +7357,8 @@ export class ClaudeAcpAgent {
       configOptions,
       agents,
       currentAgent,
+      ultracode: initialUltracode,
+      workflowsDisabled,
       fastModeEnabled,
       fastModeDisabledReason,
       abortController,
@@ -7565,19 +7621,6 @@ function isValidBaseUrl(baseUrl: string): boolean {
   return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
-// Translate a UI effort value into the flag-layer payload. The SDK
-// shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
-// and only clears a key when an explicit `null` is sent — see
-// `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
-// `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared. Typed as
-// `EffortLevel` (not `Settings["effortLevel"]`): the picker offers whatever
-// `supportedEffortLevels` reports, which includes the session-scoped `"max"`
-// that the persisted Settings shape deliberately excludes.
-function toSdkEffortLevel(value: string | undefined): EffortLevel | null {
-  return value === undefined || value === "default" ? null : (value as EffortLevel);
-}
-
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
 // ones used for Task-tool delegation (Explore, Plan, etc.) — even when the user
 // has configured none of their own. Those aren't meaningful *main-thread*
@@ -7756,6 +7799,13 @@ export function buildConfigOptions(
    *  Both session call sites always supply it (R1.1); `undefined` (direct
    *  callers/tests) omits the row. */
   thinkingEnabled?: boolean,
+  /** Display state for the Ultracode entry of the effort picker. Omitted by
+   *  direct callers/tests, in which case availability is derived from
+   *  `settings` and the entry renders unselected. */
+  ultracode?: UltracodeOptionState,
+  /** Resolved session settings, read only for `disableWorkflows` — the half of
+   *  the Ultracode gate that is not a model capability. */
+  settings?: Pick<Settings, "disableWorkflows">,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     SessionModeManager.configOption(modes),
@@ -7793,6 +7843,13 @@ export function buildConfigOptions(
     : [];
 
   if (supportedLevels.length > 0) {
+    // Ultracode rides the effort picker as one extra entry past the last level,
+    // which is where the VS Code extension draws it too. It is NOT a level (see
+    // `ultracode.ts`): the entry stands for `xhigh` plus workflow orchestration,
+    // and it is offered only when both halves are reachable.
+    const ultracodeAvailable =
+      ultracode?.available ?? isUltracodeAvailable(supportedLevels as string[], settings);
+
     const effortOptions = [
       { value: "default", name: "Default" },
       ...supportedLevels.map((level) => ({
@@ -7802,11 +7859,23 @@ export function buildConfigOptions(
           .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
           .join(" "),
       })),
+      ...(ultracodeAvailable
+        ? [{ value: ULTRACODE_OPTION_VALUE, name: ULTRACODE_OPTION_NAME }]
+        : []),
     ];
 
-    const includes = (l: string) => l === "default" || (supportedLevels as string[]).includes(l);
-    const validEffort =
-      currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
+    const includes = (l: string) =>
+      l === "default" ||
+      (supportedLevels as string[]).includes(l) ||
+      (ultracodeAvailable && l === ULTRACODE_OPTION_VALUE);
+    // `effortOptionValue` resolves the flag against the level BEFORE validation,
+    // so an Ultracode session on a model that dropped `xhigh` falls back to
+    // "Default" through the same path any unsupported level does.
+    const displayedEffort = effortOptionValue(currentEffortLevel, {
+      available: ultracodeAvailable,
+      enabled: ultracode?.enabled ?? false,
+    });
+    const validEffort = displayedEffort && includes(displayedEffort) ? displayedEffort : "default";
 
     options.push({
       id: EFFORT_CONFIG_ID,

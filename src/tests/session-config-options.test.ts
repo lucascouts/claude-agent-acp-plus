@@ -419,7 +419,7 @@ describe("session config options", () => {
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
       expect(effortOption).toBeUndefined();
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null, ultracode: null });
     });
 
     it("clamps effort in returned configOptions when new model has different supported levels", async () => {
@@ -454,7 +454,7 @@ describe("session config options", () => {
       const effortOption = response.configOptions.find((o) => o.id === "effort");
       expect(effortOption).toBeDefined();
       expect(effortOption?.currentValue).toBe("default");
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null, ultracode: null });
     });
 
     it("preserves effort in returned configOptions when new model supports same level", async () => {
@@ -520,7 +520,7 @@ describe("session config options", () => {
         value: "low",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low" });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low", ultracode: null });
     });
 
     it("calls applyFlagSettings with null effortLevel for 'default'", async () => {
@@ -535,7 +535,7 @@ describe("session config options", () => {
         value: "default",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null, ultracode: null });
 
       // The SDK's applyFlagSettings travels over a JSON pipe and only clears a
       // flag-layer key when an explicit `null` is sent — `undefined` is
@@ -546,6 +546,10 @@ describe("session config options", () => {
       const lastCallArgs = calls[calls.length - 1]?.[0];
       const serialized = JSON.parse(JSON.stringify(lastCallArgs));
       expect(serialized).toHaveProperty("effortLevel", null);
+      // `ultracode` rides the same payload and needs the same guarantee: it is
+      // cleared on every non-Ultracode selection, and an `undefined` there
+      // would leave workflow orchestration standing under a lowered effort.
+      expect(serialized).toHaveProperty("ultracode", null);
     });
 
     it("updates effort currentValue in returned configOptions", async () => {
@@ -654,7 +658,7 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null, ultracode: null });
     });
 
     it("adds effort option when switching to a model that supports effort", async () => {
@@ -725,7 +729,7 @@ describe("session config options", () => {
       // "max" is not in sonnet's levels, so should fall back to "default" (no effort override)
       expect(effortOption?.currentValue).toBe("default");
       // SDK should be told to clear the effort override
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null, ultracode: null });
     });
 
     it("preserves effort value when new model supports the same level", async () => {
