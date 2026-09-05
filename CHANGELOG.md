@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.12.0...v0.13.0) (2026-09-05)
+
+
+### Features
+
+* **adapter:** report compaction and render /usage instead of inferring and forwarding ([fc6d4d8](https://github.com/lucascouts/claude-agent-acp-plus/commit/fc6d4d8daf6ad1ce448426feb228c4282ca07e22))
+* **session:** the account is a session property, not an agent ([65e0a69](https://github.com/lucascouts/claude-agent-acp-plus/commit/65e0a69551918a3d731cfd6a143c7592f212cb40))
+
+
+### Bug Fixes
+
+* **attribution:** join a result to its turn by user_message_uuid ([a83e26c](https://github.com/lucascouts/claude-agent-acp-plus/commit/a83e26cd768eefab76b74bf2f0e4a14282481a27))
+
 ## [0.12.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.11.1...v0.12.0) (2026-09-05)
 
 
