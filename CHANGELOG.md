@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.11.1...v0.12.0) (2026-09-05)
+
+
+### Features
+
+* **effort:** offer Ultracode in the effort picker ([704824c](https://github.com/lucascouts/claude-agent-acp-plus/commit/704824c3f89f6407a7d356a974e935865c97f491))
+
+
+### Build System
+
+* **deps:** take every shared pin to the registry's latest, cooldown waived ([389078a](https://github.com/lucascouts/claude-agent-acp-plus/commit/389078adfff6f38994eee9837c4c151b6d5fb911))
+
 ## [0.11.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.11.0...v0.11.1) (2026-09-05)
 
 
