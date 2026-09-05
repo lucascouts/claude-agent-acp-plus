@@ -8,6 +8,7 @@
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
 import { SessionTitles } from "../session-titles.js";
+import { NO_PLAN_RATE_LIMITS } from "./helpers.js";
 
 /** Stand-in agent for a `SessionTitles` whose test doesn't care about titles:
  *  swallows the publish and the log, and never matches the identity check. */
@@ -34,12 +35,25 @@ export function userEcho(u: any) {
 
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
  *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
- *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
+ *  `setModel()`, and the structured `/usage` report the agent asks for at every
+ *  turn end — so a bare generator doesn't trip "x is not a function".
+ *
+ *  The usage report is here for the same reason `getContextUsage` is in
+ *  `makeMockQuery`, and the failure mode is the one that docstring warns about:
+ *  a suite whose query lacks the method does not fail, it silently routes every
+ *  turn end through the agent's error-fallback branch, so the thing under test
+ *  is exercised against a path no user takes. Defaults to a session where plan
+ *  rate limits do not apply, so a suite that does not care about quota windows
+ *  sees no extra notification; `account-usage-cadence.test.ts` overrides it by
+ *  spreading its own spy over the result of this call. */
 export function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: vi.fn(async () => ({
+      ...NO_PLAN_RATE_LIMITS,
+    })),
   }) as any;
 }
 
