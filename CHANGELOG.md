@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.13.0...v0.14.0) (2026-09-08)
+
+
+### Features
+
+* **usage:** refresh the quota windows while the session is idle ([f925bfb](https://github.com/lucascouts/claude-agent-acp-plus/commit/f925bfbc50efdb2abbad78dec85317d39803731a))
+
+
+### Miscellaneous Chores
+
+* **deps:** bump the actions group with 2 updates ([#88](https://github.com/lucascouts/claude-agent-acp-plus/issues/88)) ([869f275](https://github.com/lucascouts/claude-agent-acp-plus/commit/869f2758d5c91906ef116264c9f987d88bc63b36))
+
 ## [0.13.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.12.0...v0.13.0) (2026-09-05)
 
 
