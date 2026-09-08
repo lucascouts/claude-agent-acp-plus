@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import { ClaudeAcpAgent, quotaPollIntervalMs, type AcpClient } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { NO_PLAN_RATE_LIMITS } from "./helpers.js";
 import {
@@ -17,7 +17,13 @@ import {
  * Contract (R1.1, R1.2, R1.7, R1.8): the report is requested once when the
  * session is established, so the bars are born filled rather than waiting for a
  * push that may never come, and once again at the end of each turn, which is
- * when consumption actually changed. A failed request leaves the session
+ * when consumption actually changed.
+ *
+ * A third moment was added later: an idle refresh on a timer. The two borders
+ * above are both *consumption* events, and none of them is *time* — so a window
+ * that resets while nobody is prompting kept showing the old utilization until
+ * somebody sent a prompt. The tick stands down while a turn is in flight (that
+ * turn's own end already refreshes) and dies with the query stream. A failed request leaves the session
  * running and reports nothing, and the live `rate_limit_event` forwarding — the
  * only source of a MEASURED status — keeps working alongside the new one.
  *
@@ -115,7 +121,7 @@ vi.mock("../tools.js", async (importOriginal) => {
 
 let sessionStartUsage: () => Promise<unknown>;
 
-describe("the structured usage report is requested at both borders", () => {
+describe("the structured usage report is requested at both borders, and while idle", () => {
   let notifications: SessionNotification[];
   let agent: ClaudeAcpAgent;
 
@@ -142,12 +148,49 @@ describe("the structured usage report is requested at both borders", () => {
     yield { type: "system", subtype: "session_state_changed", state: "idle" };
   }
 
+  /** Like `oneTurn`, but the stream stays OPEN afterwards, which is what the real
+   *  long-lived consumer sees: it forwards background and between-turn output,
+   *  so its query does not end when a turn does. The idle refresh lives entirely
+   *  in that window, so a double that ends the stream closes the gap under test
+   *  and would let a broken timer pass. */
+  async function* turnsThenIdle(input: Pushable<any>, extra: unknown[] = []) {
+    for await (const userMessage of input) {
+      yield userEcho(userMessage);
+      for (const message of extra) {
+        yield message;
+      }
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+  }
+
+  /** Install a session whose stream outlives the turn (see `turnsThenIdle`). */
+  function installLiveSession(usage: ReturnType<typeof vi.fn>, extra: unknown[] = []) {
+    const input = new Pushable<any>();
+    const query = Object.assign(wrapQuery(turnsThenIdle(input, extra)), {
+      [USAGE_METHOD]: usage,
+    });
+    agent.sessions[SESSION_ID] = mockSessionState({ query, input }, agent);
+    return input;
+  }
+
   /** Install a session whose `Query` answers the usage request with `usage`. */
   function installSession(usage: ReturnType<typeof vi.fn>, extra: unknown[] = []) {
     const input = new Pushable<any>();
     const query = Object.assign(wrapQuery(oneTurn(input, extra)), { [USAGE_METHOD]: usage });
     agent.sessions[SESSION_ID] = mockSessionState({ query, input }, agent);
     return input;
+  }
+
+  /** A turn against a live stream. Unlike `runTurn` this does NOT await the
+   *  consumer: a long-lived consumer only settles when the stream ends, so
+   *  awaiting it here would hang. The prompt resolving is the turn ending; the
+   *  refresh that follows is picked up with `waitFor`. */
+  async function runTurnLive() {
+    return agent.prompt({
+      sessionId: SESSION_ID,
+      prompt: [{ type: "text", text: "hello" }],
+    });
   }
 
   async function runTurn() {
@@ -235,5 +278,89 @@ describe("the structured usage report is requested at both borders", () => {
     const derived = payloads.filter((payload) => payload.rateLimitType === "seven_day");
     expect(derived).toHaveLength(1);
     expect(derived[0]).toEqual(expect.objectContaining({ utilization: 0.42 }));
+  });
+
+  it("asks for the plan limits without the transcript scan", async () => {
+    const usage = vi.fn(async () => weeklyReport());
+    installSession(usage);
+
+    await runTurn();
+
+    await vi.waitFor(() => expect(usage).toHaveBeenCalled());
+    // Nothing on this path reads `behaviors`, and filling it costs a scan of
+    // every local transcript. Pinned as an argument rather than left to a
+    // default so the cost cannot come back silently.
+    expect(usage).toHaveBeenCalledWith({ skipBehaviors: true });
+  });
+
+  it("refreshes again while idle, with no turn to carry it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const usage = vi.fn(async () => weeklyReport());
+      installLiveSession(usage);
+
+      await runTurnLive();
+      await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+
+      // The whole point: no prompt is sent between here and the assertion.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(usage).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(usage).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops refreshing once the session's stream is closed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const usage = vi.fn(async () => weeklyReport());
+      installLiveSession(usage);
+
+      await runTurnLive();
+      await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+
+      // Proves it was ticking BEFORE the close, so the assertion after it means
+      // "stopped" rather than "never started".
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(usage).toHaveBeenCalledTimes(2);
+
+      await agent.closeSession({ sessionId: SESSION_ID });
+      const afterClose = usage.mock.calls.length;
+
+      // A timer that outlives its stream does not fail loudly — it just asks a
+      // dead session for a report once a minute, forever.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(usage).toHaveBeenCalledTimes(afterClose);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("the idle refresh interval is read from the environment", () => {
+  it("defaults when unset or empty", () => {
+    expect(quotaPollIntervalMs(undefined)).toBe(60_000);
+    expect(quotaPollIntervalMs("   ")).toBe(60_000);
+  });
+
+  it("treats exactly 0 as off, because that is the only way to ask", () => {
+    expect(quotaPollIntervalMs("0")).toBe(0);
+  });
+
+  it("raises anything under the floor rather than honouring it", () => {
+    // Each tick is a control request, and neither window moves fast enough for
+    // a tighter loop to show something a 15-second one would miss.
+    expect(quotaPollIntervalMs("1")).toBe(15_000);
+    expect(quotaPollIntervalMs("30000")).toBe(30_000);
+  });
+
+  it("falls back to the default on garbage, never to off", () => {
+    // A typo must not silently restore the stale-bars behaviour this exists to
+    // fix; only an explicit 0 may do that.
+    expect(quotaPollIntervalMs("banana")).toBe(60_000);
+    expect(quotaPollIntervalMs("-5")).toBe(60_000);
   });
 });

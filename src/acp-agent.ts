@@ -510,6 +510,41 @@ type Turn = {
   completion?: Promise<void>;
 };
 
+/** How often the account quota windows are refreshed while a session sits idle,
+ *  in milliseconds; `0` disables polling entirely.
+ *
+ *  Without this the windows move at only three moments: session establishment,
+ *  the end of every turn, and a pushed `rate_limit_event`. None of them is time
+ *  — so a five-hour window that resets while nobody is prompting keeps showing
+ *  the old utilization, and the bar is wrong in the one direction that matters
+ *  (it under-reports how much is available) until the next turn ends.
+ *
+ *  The floor is not timidity: each tick costs one control request, and neither
+ *  the five-hour nor the seven-day window can move fast enough for a tighter
+ *  loop to show anything a 15-second one would miss. */
+const QUOTA_POLL_DEFAULT_MS = 60_000;
+const QUOTA_POLL_FLOOR_MS = 15_000;
+
+/** Resolve the poll interval from the environment, clamped. An unparseable or
+ *  negative value falls back to the default rather than disabling the refresh:
+ *  a typo should not silently return the bars to the stale behaviour this
+ *  exists to fix. Exactly `0` disables, because that is the only way to ask. */
+export function quotaPollIntervalMs(
+  raw: string | undefined = process.env.CLAUDE_ACP_QUOTA_POLL_MS,
+): number {
+  if (raw === undefined || raw.trim() === "") {
+    return QUOTA_POLL_DEFAULT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return QUOTA_POLL_DEFAULT_MS;
+  }
+  if (parsed === 0) {
+    return 0;
+  }
+  return Math.max(parsed, QUOTA_POLL_FLOOR_MS);
+}
+
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -712,6 +747,14 @@ export type Session = {
    *  active turn settles normally so the backstop never fires after a clean
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
+  /** Repeating timer that refreshes the account quota windows while this session
+   *  is idle. Armed at the end of the first turn rather than at session
+   *  establishment: before then a control request is not serviced at all
+   *  (issues #886/#880), so an earlier timer would only log failures. Cleared in
+   *  `closeQueryStream` — the one point every teardown path passes through --
+   *  so it cannot outlive the stream it queries. Undefined while polling is
+   *  disabled or before the first turn settles. */
+  accountUsageTimer?: ReturnType<typeof setInterval>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Whether nested subagent text/thinking is forwarded to the ACP client.
    *  Enabled by either the ACP capability or the pre-existing SDK option. */
@@ -2273,8 +2316,14 @@ export class ClaudeAcpAgent {
       // answers to, and it is written out here rather than hidden behind a
       // helper so a rename lands as one named failure in the log below, not as
       // a quiet degradation to no report at all.
-      const report =
-        await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      // `skipBehaviors` drops the local-transcript scan that fills the report's
+      // `behaviors` section. Nothing here reads it — `windowsFrom` touches only
+      // `rate_limits_available` and `rate_limits` — so on every call, not just
+      // the polled ones, that scan was pure cost. `/usage` still asks for the
+      // full report, because it renders those contributions.
+      const report = await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({
+        skipBehaviors: true,
+      });
       // The session can be torn down or recreated while the request is in
       // flight (provider switch, a changed cwd on session/load). A successor
       // must not inherit its predecessor's windows.
@@ -2309,6 +2358,51 @@ export class ClaudeAcpAgent {
     } catch (error) {
       this.logger.error(`Session ${sessionId}: structured usage report unavailable: ${error}`);
     }
+  }
+
+  /** Start the idle refresh of the account quota windows for this session.
+   *
+   *  Idempotent, and deliberately called at the end of every turn rather than
+   *  once: the first call arms, the rest return immediately, so no caller has to
+   *  know whether this is turn one.
+   *
+   *  The tick does nothing while a turn is in flight. That turn's own end
+   *  already refreshes the windows, and a second control request would buy the
+   *  same answer twice — the same reasoning that excludes autonomous cycles at
+   *  the end-of-turn call site. */
+  private armAccountUsagePolling(sessionId: string, session: Session): void {
+    if (session.accountUsageTimer) {
+      return;
+    }
+    const intervalMs = quotaPollIntervalMs();
+    if (intervalMs === 0) {
+      return;
+    }
+    // Closure-local rather than a Session field: it guards this timer alone, and
+    // a slow report must not let ticks pile up into a queue of duplicate control
+    // requests against a session that is already struggling to answer one.
+    let inFlight = false;
+    const timer = setInterval(() => {
+      // Re-resolve through the map. A provider update replaces the Session
+      // object under the same id and the replacement arms its own timer, so an
+      // orphaned closure must retire rather than keep polling a husk.
+      if (this.sessions[sessionId] !== session || session.queryClosed) {
+        clearInterval(timer);
+        return;
+      }
+      if (session.turnQueue?.length || session.activeTurn || inFlight) {
+        return;
+      }
+      inFlight = true;
+      // `publishAccountUsage` never rejects — it logs and returns — so this
+      // cannot become an unhandled rejection, and `finally` always re-opens.
+      void this.publishAccountUsage(sessionId, session).finally(() => {
+        inFlight = false;
+      });
+    }, intervalMs);
+    // A quota refresh is never a reason to keep the process alive.
+    timer.unref?.();
+    session.accountUsageTimer = timer;
   }
 
   private async publishGoalFromPrompt(
@@ -4567,6 +4661,10 @@ export class ClaudeAcpAgent {
                 // the trailing idle is, and a stalled control request there is
                 // the same exposure `fetchContextUsedTokens` already accepts.
                 await this.publishAccountUsage(params.sessionId, session);
+                // A settled turn is the proof that control requests are being
+                // serviced (before the first one they are not — #886/#880), so
+                // this is the earliest honest moment to start the idle refresh.
+                this.armAccountUsagePolling(params.sessionId, session);
               }
             }
             break;
@@ -5528,6 +5626,15 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.consumer = undefined;
+    // Every teardown path reaches this method, which is why the quota timer is
+    // cleared here and nowhere else: a `clearInterval` repeated at each of the
+    // four call sites is one merge away from missing the fifth. A session whose
+    // stream is closed cannot answer the usage control request anyway, so a
+    // surviving timer would only log a failure a minute, forever.
+    if (session.accountUsageTimer) {
+      clearInterval(session.accountUsageTimer);
+      session.accountUsageTimer = undefined;
+    }
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
