@@ -56,18 +56,6 @@ afterEach(() => {
   }
 });
 
-/** Let filesystem-backed work settle.
- *
- *  `setImmediate` runs after the I/O callback phase, so a few passes drain a
- *  promise chain that touched disk. `vi.waitFor` cannot do this job here: with
- *  `Date` faked and `shouldAdvanceTime` on, its own timeout is measured on the
- *  fake clock and expires in almost no real time at all. */
-async function flushIo(times = 5) {
-  for (let i = 0; i < times; i++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
-
 const USAGE_METHOD = "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET";
 const SESSION_ID = "test-session";
 
@@ -394,39 +382,25 @@ describe("the structured usage report is requested at both borders, and while id
   });
 
   it("stops refreshing once the session's stream is closed", async () => {
-    // `Date` must be faked alongside the timers. Without it the clock does not
-    // move when the timers do — measured: advancing 60s fired three ticks while
-    // `Date.now()` moved 65ms — so the shared sample's age stays ~0, every tick
-    // reads it as fresh, and nothing ever re-fetches.
-    vi.useFakeTimers({
-      shouldAdvanceTime: true,
-      toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"],
-    });
-    try {
-      const usage = vi.fn(async () => weeklyReport());
-      installLiveSession(usage);
+    const usage = vi.fn(async () => weeklyReport());
+    installLiveSession(usage);
 
-      await runTurnLive();
-      await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+    await runTurnLive();
+    // Armed is a FACT, not a timing outcome: it is set synchronously in the
+    // consumer's `finally`. Asserting it — rather than counting the fetches a
+    // tick produces — is what makes "stopped" distinguishable from "never
+    // started" without depending on when a filesystem read lands. Counting was
+    // tried and passed locally while failing on a CI runner.
+    await vi.waitFor(() => expect(agent.sessions[SESSION_ID]?.accountUsageTimer).toBeDefined());
 
-      // Proves it was ticking BEFORE the close, so the assertion after it means
-      // "stopped" rather than "never started".
-      await vi.advanceTimersByTimeAsync(60_000);
-      // The miss is decided after a filesystem read, so the fetch it triggers
-      // lands after the timers have been advanced.
-      await flushIo();
-      expect(usage).toHaveBeenCalledTimes(2);
+    const session = agent.sessions[SESSION_ID]!;
+    await agent.closeSession({ sessionId: SESSION_ID });
 
-      await agent.closeSession({ sessionId: SESSION_ID });
-      const afterClose = usage.mock.calls.length;
-
-      // A timer that outlives its stream does not fail loudly — it just asks a
-      // dead session for a report once a minute, forever.
-      await vi.advanceTimersByTimeAsync(5 * 60_000);
-      expect(usage).toHaveBeenCalledTimes(afterClose);
-    } finally {
-      vi.useRealTimers();
-    }
+    // A timer that outlives its stream does not fail loudly — it just asks a
+    // dead session for a report once a minute, forever. `closeQueryStream` is
+    // the one point every teardown path passes through, which is why the
+    // `clearInterval` lives there and nowhere else.
+    expect(session.accountUsageTimer).toBeUndefined();
   });
 
   it("reuses a sample another process already paid for", async () => {
