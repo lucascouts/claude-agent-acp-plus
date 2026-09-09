@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
+import { promises as fsp } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { quotaCachePath, writeLimits } from "../quota-cache.js";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 import { ClaudeAcpAgent, quotaPollIntervalMs, type AcpClient } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -32,6 +36,37 @@ import {
  * is the only name the real `Query` answers to, and a rename must fail loudly
  * rather than degrade to no report at all.
  */
+
+// The interval's default parameter reads `process.env`, so a desktop that has
+// CLAUDE_ACP_QUOTA_POLL_MS set — as this one does — silently changes what these
+// tests measure. Cleared for every case in this file, and restored after, so the
+// cadence under test is the code's and not the machine's.
+let savedPollEnv: string | undefined;
+
+beforeEach(() => {
+  savedPollEnv = process.env.CLAUDE_ACP_QUOTA_POLL_MS;
+  delete process.env.CLAUDE_ACP_QUOTA_POLL_MS;
+});
+
+afterEach(() => {
+  if (savedPollEnv === undefined) {
+    delete process.env.CLAUDE_ACP_QUOTA_POLL_MS;
+  } else {
+    process.env.CLAUDE_ACP_QUOTA_POLL_MS = savedPollEnv;
+  }
+});
+
+/** Let filesystem-backed work settle.
+ *
+ *  `setImmediate` runs after the I/O callback phase, so a few passes drain a
+ *  promise chain that touched disk. `vi.waitFor` cannot do this job here: with
+ *  `Date` faked and `shouldAdvanceTime` on, its own timeout is measured on the
+ *  fake clock and expires in almost no real time at all. */
+async function flushIo(times = 5) {
+  for (let i = 0; i < times; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 const USAGE_METHOD = "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET";
 const SESSION_ID = "test-session";
@@ -202,10 +237,39 @@ describe("the structured usage report is requested at both borders, and while id
     return response;
   }
 
-  beforeEach(() => {
+  let runtimeDir: string;
+  let savedRuntimeDir: string | undefined;
+
+  beforeEach(async () => {
+    // A private XDG_RUNTIME_DIR: without it these tests read the shared sample
+    // this machine's real adapters are writing, and "did it fetch?" stops being
+    // a question about the code.
+    savedRuntimeDir = process.env.XDG_RUNTIME_DIR;
+    runtimeDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cadence-"));
+    process.env.XDG_RUNTIME_DIR = runtimeDir;
     notifications = [];
     sessionStartUsage = async () => weeklyReport();
     agent = new ClaudeAcpAgent(createMockClient(), { log: () => {}, error: () => {} });
+  });
+
+  afterEach(async () => {
+    // A session's poll timer outlives the test that armed it: nothing here closes
+    // the session, and `clearInterval` lives in `closeQueryStream`. Left running,
+    // a previous case's timer keeps ticking into the next one and overwrites the
+    // shared sample under it — which is exactly how the reuse case failed in the
+    // suite while passing alone.
+    for (const session of Object.values(agent.sessions)) {
+      if (session?.accountUsageTimer) {
+        clearInterval(session.accountUsageTimer);
+        session.accountUsageTimer = undefined;
+      }
+    }
+    if (savedRuntimeDir === undefined) {
+      delete process.env.XDG_RUNTIME_DIR;
+    } else {
+      process.env.XDG_RUNTIME_DIR = savedRuntimeDir;
+    }
+    await fsp.rm(runtimeDir, { recursive: true, force: true });
   });
 
   it("issues exactly one request when the session is established (R1.1)", async () => {
@@ -293,28 +357,51 @@ describe("the structured usage report is requested at both borders, and while id
     expect(usage).toHaveBeenCalledWith({ skipBehaviors: true });
   });
 
-  it("refreshes again while idle, with no turn to carry it", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
+  it("ticks while idle, and asks the polled path for a shared sample", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"],
+    });
     try {
       const usage = vi.fn(async () => weeklyReport());
       installLiveSession(usage);
 
       await runTurnLive();
-      await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+      // Wait for the ARM, not just for the turn: it happens in the consumer's
+      // `finally`, which settles after the prompt resolves.
+      await vi.waitFor(() => expect(agent.sessions[SESSION_ID]?.accountUsageTimer).toBeDefined());
 
-      // The whole point: no prompt is sent between here and the assertion.
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(usage).toHaveBeenCalledTimes(2);
+      // Asserted at the call, not at its effect. Everything the tick DOES now
+      // begins with a filesystem read, and that promise settles on the
+      // threadpool — outside what `advanceTimersByTimeAsync` drains — so an
+      // assertion about the outcome races the work it is asserting. What this
+      // case owns is narrower and stable: while idle, the timer fires, and it
+      // asks for the SHARED sample rather than paying for its own.
+      const polled = vi
+        .spyOn(
+          agent as unknown as { publishAccountUsage: () => Promise<void> },
+          "publishAccountUsage",
+        )
+        .mockResolvedValue(undefined);
 
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(usage).toHaveBeenCalledTimes(3);
+
+      expect(polled).toHaveBeenCalledWith(SESSION_ID, expect.anything(), { allowCache: true });
+      polled.mockRestore();
     } finally {
       vi.useRealTimers();
     }
   });
 
   it("stops refreshing once the session's stream is closed", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // `Date` must be faked alongside the timers. Without it the clock does not
+    // move when the timers do — measured: advancing 60s fired three ticks while
+    // `Date.now()` moved 65ms — so the shared sample's age stays ~0, every tick
+    // reads it as fresh, and nothing ever re-fetches.
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"],
+    });
     try {
       const usage = vi.fn(async () => weeklyReport());
       installLiveSession(usage);
@@ -325,6 +412,9 @@ describe("the structured usage report is requested at both borders, and while id
       // Proves it was ticking BEFORE the close, so the assertion after it means
       // "stopped" rather than "never started".
       await vi.advanceTimersByTimeAsync(60_000);
+      // The miss is decided after a filesystem read, so the fetch it triggers
+      // lands after the timers have been advanced.
+      await flushIo();
       expect(usage).toHaveBeenCalledTimes(2);
 
       await agent.closeSession({ sessionId: SESSION_ID });
@@ -337,6 +427,103 @@ describe("the structured usage report is requested at both borders, and while id
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reuses a sample another process already paid for", async () => {
+    const usage = vi.fn(async () => weeklyReport());
+    installSession(usage);
+    await runTurn();
+    await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+
+    // A DIFFERENT adapter process publishes a sample. That is the whole point:
+    // ten Zed windows asking one account the same question should cost one
+    // request and — because they read one sample instead of each taking their
+    // own at its own instant — should agree.
+    //
+    // 99, not 0.99: a raw report carries percentages (`weeklyReport()` says 42
+    // for 42%) and `normalizeUtilization` divides by 100 on the way out.
+    await writeLimits({
+      rate_limits_available: true,
+      rate_limits: { seven_day: { utilization: 99 } },
+    } as never);
+
+    // The polled path, invoked directly. Driving it through the timer instead
+    // made the assertion depend on fake-clock arithmetic rather than on the
+    // contract, and it failed in the suite while passing alone. The timer's own
+    // wiring is covered by the two cases around this one.
+    const session = agent.sessions[SESSION_ID]!;
+    await (
+      agent as unknown as {
+        publishAccountUsage: (
+          id: string,
+          s: typeof session,
+          o: { allowCache: boolean },
+        ) => Promise<void>;
+      }
+    ).publishAccountUsage(SESSION_ID, session, { allowCache: true });
+
+    // No second request...
+    expect(usage).toHaveBeenCalledTimes(1);
+    // ...and not merely silence: it published the OTHER process's numbers.
+    expect(quotaPayloads(notifications)).toContainEqual(
+      expect.objectContaining({ rateLimitType: "seven_day", utilization: 0.99 }),
+    );
+  });
+
+  it("still fetches once the shared sample has aged out", async () => {
+    const usage = vi.fn(async () => weeklyReport());
+    installSession(usage);
+    await runTurn();
+    await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+
+    // A sample from two minutes ago: past the freshness window whatever the
+    // interval, so the polled path must pay for a new one. Somebody has to, or
+    // sharing would mean the account is never sampled again.
+    await writeLimits(
+      { rate_limits_available: true, rate_limits: { seven_day: { utilization: 7 } } } as never,
+      Date.now() - 120_000,
+    );
+
+    // Invoked directly rather than driven through the timer. Deciding a miss
+    // now takes a filesystem read, and that promise settles on the threadpool —
+    // outside what `advanceTimersByTimeAsync` drains — so a timer-driven version
+    // of this assertion races the fetch it is asserting. The timer's own
+    // behaviour is covered by the two cases around this one: that it fires while
+    // idle, and that it stops when the stream closes.
+    const session = agent.sessions[SESSION_ID]!;
+    await (
+      agent as unknown as {
+        publishAccountUsage: (
+          id: string,
+          s: typeof session,
+          o: { allowCache: boolean },
+        ) => Promise<void>;
+      }
+    ).publishAccountUsage(SESSION_ID, session, { allowCache: true });
+
+    expect(usage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a fresh shared sample stand in for a turn's own refresh", async () => {
+    const usage = vi.fn(async () => weeklyReport());
+    installSession(usage);
+    await writeLimits({
+      rate_limits_available: true,
+      rate_limits: { seven_day: { utilization: 50 } },
+    } as never);
+
+    await runTurn();
+
+    // R1.2: a turn ending is the moment THIS session's consumption changed, so
+    // it asks for itself. Reading a sample taken before the turn would report
+    // the account as it was before the tokens this turn just spent.
+    await vi.waitFor(() => expect(usage).toHaveBeenCalled());
+    expect(usage).toHaveBeenCalledTimes(1);
+    // The share is fired and not awaited, so wait for it rather than assuming
+    // it beat this assertion.
+    await vi.waitFor(async () =>
+      expect(await fsp.readFile(quotaCachePath(), "utf8")).toContain('"utilization":42'),
+    );
   });
 });
 

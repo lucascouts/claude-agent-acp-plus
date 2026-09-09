@@ -74,6 +74,14 @@ type ReportedWindow = {
 };
 
 /** Where one emitted window comes from: the wire kind, and the report entry behind it. */
+/** The slice of a usage report that describes plan windows, and nothing else.
+ *  Structurally satisfied by `SDKControlGetUsageResponse` and by a cached
+ *  sample, which is the point: the two callers hand over the same two fields. */
+export type QuotaLimitsReport = Pick<
+  SDKControlGetUsageResponse,
+  "rate_limits_available" | "rate_limits"
+>;
+
 type WindowSource = [rateLimitType: string, entry: ReportedWindow | null | undefined];
 
 /**
@@ -391,8 +399,14 @@ export class AccountUsageTracker {
   /**
    * Every window the report carries, in wire shape. Empty list when
    * `rate_limits_available` is false or `rate_limits` is null.
+   *
+   * The parameter is narrowed to the two fields actually read, not the whole
+   * `SDKControlGetUsageResponse`. That is what lets a sample shared between
+   * processes (quota-cache.ts) be handed here without carrying the rest of the
+   * report with it -- the rest is session-scoped (this session's cost, this
+   * session's token totals) and belongs to nobody else.
    */
-  windowsFrom(report: SDKControlGetUsageResponse): AccountQuotaWindow[] {
+  windowsFrom(report: QuotaLimitsReport): AccountQuotaWindow[] {
     // R1.5: the flag governs, not the presence of data. A report can carry a
     // populated `rate_limits` while declaring the limits inapplicable, and a
     // section of bars then states the account is unused rather than unmeasured.

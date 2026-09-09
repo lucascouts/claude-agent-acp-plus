@@ -204,6 +204,7 @@ import {
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { AccountUsageTracker } from "./account-usage.js";
+import { readFreshLimits, sharedSampleMaxAgeMs, writeLimits } from "./quota-cache.js";
 import {
   ACCOUNT_CONFIG_ID,
   accountForValue,
@@ -2310,7 +2311,20 @@ export class ClaudeAcpAgent {
    * only that the request failed and why) and the previously reported windows
    * are left standing, because nothing was sent.
    */
-  private async publishAccountUsage(sessionId: string, session: Session): Promise<void> {
+  /** Fetch the account's quota windows and publish them to this session.
+   *
+   *  `allowCache` is the difference between the two callers. A turn ending and a
+   *  session being established are moments when THIS session's own consumption
+   *  just changed, so they always fetch. The idle poll has no such reason: it is
+   *  asking about an account, and every other adapter process on the desktop is
+   *  asking the same question about the same account. It reads the shared sample
+   *  instead -- see quota-cache.ts for why sharing, not tighter intervals, is
+   *  what makes separate windows agree. */
+  private async publishAccountUsage(
+    sessionId: string,
+    session: Session,
+    { allowCache = false }: { allowCache?: boolean } = {},
+  ): Promise<void> {
     try {
       // Not `getUsage`: this awful spelling is the only name the real `Query`
       // answers to, and it is written out here rather than hidden behind a
@@ -2321,9 +2335,23 @@ export class ClaudeAcpAgent {
       // `rate_limits_available` and `rate_limits` — so on every call, not just
       // the polled ones, that scan was pure cost. `/usage` still asks for the
       // full report, because it renders those contributions.
-      const report = await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({
-        skipBehaviors: true,
-      });
+      // A sample another process already paid for, when this call is allowed to
+      // take one. `null` covers every failure the cache can have, so a broken
+      // cache degrades to exactly the behaviour that existed before it.
+      const cached = allowCache
+        ? await readFreshLimits(sharedSampleMaxAgeMs(quotaPollIntervalMs()))
+        : null;
+      const report =
+        cached ??
+        (await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({
+          skipBehaviors: true,
+        }));
+      if (!cached) {
+        // Fired, not awaited: the other processes benefit from this sample, but
+        // this session's own client must not wait on a filesystem write to see
+        // its bars. `writeLimits` never rejects.
+        void writeLimits(report);
+      }
       // The session can be torn down or recreated while the request is in
       // flight (provider switch, a changed cwd on session/load). A successor
       // must not inherit its predecessor's windows.
@@ -2396,7 +2424,7 @@ export class ClaudeAcpAgent {
       inFlight = true;
       // `publishAccountUsage` never rejects — it logs and returns — so this
       // cannot become an unhandled rejection, and `finally` always re-opens.
-      void this.publishAccountUsage(sessionId, session).finally(() => {
+      void this.publishAccountUsage(sessionId, session, { allowCache: true }).finally(() => {
         inFlight = false;
       });
     }, intervalMs);
