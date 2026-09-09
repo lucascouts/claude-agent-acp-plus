@@ -135,33 +135,43 @@ describe("a sample is shared between processes, or it is a miss", () => {
   });
 });
 
-describe("the file is scoped to the credentials that produced the sample", () => {
-  it("separates an API-key session from a subscription one", async () => {
-    // The case that makes scoping mandatory: an API-key session reports
-    // `rate_limits_available: false` and no windows. One shared file would let
-    // it publish that emptiness to every subscription window on the desktop.
-    const subscription = quotaCachePath();
+describe("an API-key session does not share at all", () => {
+  it("reads nothing, even from a sample that is there and fresh", async () => {
+    await writeLimits(LIMITS, 1_000);
+    expect(await readFreshLimits(60_000, 1_500)).toEqual(LIMITS);
+
+    // An API-key session reports `rate_limits_available: false` and emits zero
+    // `_claude/rateLimit` frames (measured on the wire for R8.1). It has no plan
+    // window to gain, so it must not pick up a subscription session's.
     process.env.ANTHROPIC_API_KEY = "sk-ant-whatever";
-    expect(quotaCachePath()).not.toBe(subscription);
+    expect(await readFreshLimits(60_000, 1_500)).toBeNull();
   });
 
-  it("separates two different API keys", async () => {
+  it("writes nothing, so it cannot publish its emptiness to anyone", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-whatever";
+    await writeLimits(LIMITS, 1_000);
+    expect((await fs.readdir(dir)).length).toBe(0);
+  });
+
+  it("never lets the key reach a hash", async () => {
+    // The first version folded a digest of the key into the filename to keep two
+    // keys apart. CodeQL flagged it (js/insufficient-password-hash) and excluding
+    // the case turned out to be stronger than hashing it well: two keys cannot
+    // collide in a file neither of them writes.
     process.env.ANTHROPIC_API_KEY = "sk-ant-one";
     const first = quotaCachePath();
-    process.env.ANTHROPIC_API_KEY = "sk-ant-two";
-    expect(quotaCachePath()).not.toBe(first);
+    process.env.ANTHROPIC_API_KEY = "sk-ant-two-completely-different";
+    expect(quotaCachePath()).toBe(first);
+    expect(path.basename(first)).not.toContain("sk-ant");
   });
+});
 
+describe("the file is scoped to the configuration that produced the sample", () => {
   it("separates two config directories", async () => {
     process.env.ANTHROPIC_CONFIG_DIR = "/home/someone/.claude-a";
     const first = quotaCachePath();
     process.env.ANTHROPIC_CONFIG_DIR = "/home/someone/.claude-b";
     expect(quotaCachePath()).not.toBe(first);
-  });
-
-  it("never puts a credential in the filename", async () => {
-    process.env.ANTHROPIC_API_KEY = "sk-ant-secret-value";
-    expect(path.basename(quotaCachePath())).not.toContain("secret");
   });
 
   it("lives under XDG_RUNTIME_DIR when there is one", async () => {

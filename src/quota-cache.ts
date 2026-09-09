@@ -39,23 +39,38 @@ export type CachedLimits = QuotaLimitsReport;
 type CacheFile = CachedLimits & { fetchedAt: number };
 
 /**
+ * Whether this session may share a sample at all.
+ *
+ * It may not when `ANTHROPIC_API_KEY` is set, and the reason is the measurement
+ * behind R8.1 rather than caution: an API-key session reports
+ * `rate_limits_available: false` and emits ZERO `_claude/rateLimit` frames. It
+ * has no plan window to publish and none to gain, so the cache has nothing to do
+ * for it.
+ *
+ * That also settles a question the first version answered badly. Two different
+ * API keys can be two different accounts, so they must not share a file --
+ * which the first version enforced by folding a digest of the key into the
+ * filename. CodeQL flagged it (`js/insufficient-password-hash`, alert 27) and
+ * was right to: the rule guards stored, verified credentials, and this was
+ * neither, but "not exploitable" is the argument that ages badly. Excluding the
+ * whole case is stronger than hashing it well -- the credential never reaches a
+ * hash, and the behaviour is the one the wire already described.
+ */
+function sharingDisabled(): boolean {
+  return Boolean(process.env.ANTHROPIC_API_KEY);
+}
+
+/**
  * A cache is only shareable between processes answering for the SAME account.
  *
- * The api-key entry is the case that makes this mandatory rather than tidy: a
- * session authenticated by `ANTHROPIC_API_KEY` reports `rate_limits_available:
- * false` and no windows at all. Sharing one file with a subscription session
- * would let it publish that emptiness to every other window on the desktop.
- *
- * The key is a digest. The API key itself is hashed before it contributes, so
- * two different keys cannot collide while neither appears in a filename.
+ * With API keys excluded above, what remains to separate is the configuration
+ * directory: two config scopes can be two logins, and neither should publish
+ * the other's windows.
  */
 function scopeKey(): string {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  const scope = [
-    process.env.ANTHROPIC_CONFIG_DIR ?? "",
-    process.env.CLAUDE_CONFIG_DIR ?? "",
-    apiKey ? createHash("sha256").update(apiKey).digest("hex") : "",
-  ].join("\0");
+  const scope = [process.env.ANTHROPIC_CONFIG_DIR ?? "", process.env.CLAUDE_CONFIG_DIR ?? ""].join(
+    "\0",
+  );
   return createHash("sha256").update(scope).digest("hex").slice(0, 16);
 }
 
@@ -98,6 +113,9 @@ export async function readFreshLimits(
   maxAgeMs: number,
   now: number = Date.now(),
 ): Promise<CachedLimits | null> {
+  if (sharingDisabled()) {
+    return null;
+  }
   try {
     const raw = await fs.readFile(quotaCachePath(), "utf8");
     const parsed = JSON.parse(raw) as CacheFile;
@@ -130,6 +148,9 @@ export async function readFreshLimits(
  * are idempotent and the loser's work is simply discarded.
  */
 export async function writeLimits(limits: CachedLimits, now: number = Date.now()): Promise<void> {
+  if (sharingDisabled()) {
+    return;
+  }
   const target = quotaCachePath();
   // Unique per WRITE, not per process. One adapter process serves several
   // sessions, so a turn ending in one can coincide with another's tick: sharing
