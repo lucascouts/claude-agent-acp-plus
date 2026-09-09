@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.0...v0.15.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **usage:** an API-key session shares nothing, so the key never reaches a hash ([1606b98](https://github.com/lucascouts/claude-agent-acp-plus/commit/1606b98baff993ed6117a17417e5e3f549a37310))
+
 ## [0.15.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.14.0...v0.15.0) (2026-09-09)
 
 
