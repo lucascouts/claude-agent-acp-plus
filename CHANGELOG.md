@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.14.0...v0.15.0) (2026-09-09)
+
+
+### Features
+
+* **usage:** one quota sample per machine, shared between adapter processes ([f46da14](https://github.com/lucascouts/claude-agent-acp-plus/commit/f46da14e3a696544c0d182bf5920380e3d6def8f))
+
 ## [0.14.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.13.0...v0.14.0) (2026-09-08)
 
 
