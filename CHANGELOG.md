@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.1...v0.15.2) (2026-09-11)
+
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump vitest from 4.1.11 to 5.0.0 ([#92](https://github.com/lucascouts/claude-agent-acp-plus/issues/92)) ([7d42e18](https://github.com/lucascouts/claude-agent-acp-plus/commit/7d42e183245affa3f4df23f493f5fb020df3b953))
+
 ## [0.15.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.0...v0.15.1) (2026-09-09)
 
 
