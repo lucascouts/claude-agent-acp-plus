@@ -94,6 +94,8 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
+import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import { SessionTiming } from "./session-timing.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -7615,6 +7617,7 @@ export class ClaudeAcpAgent {
       settingsManager,
       this.logger,
       creationOpts.resume !== undefined,
+      creationOpts.resume,
     );
 
     // Resolve the current model's capabilities separately from the stable
@@ -8790,15 +8793,63 @@ async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
   logger: Logger,
+  sessionId?: string,
 ): Promise<{
   model: ModelInfo | null;
   contextWindow: number | null;
   contextUsedTokens: number | null;
 }> {
-  try {
-    const usage = await query.getContextUsage();
+  // The local transcript is asked FIRST and in parallel, never instead. It is
+  // the same field Claude Code itself restores a resumed query from, it is a
+  // file read rather than IPC, and it answers when the control request cannot
+  // — which is the case this ordering exists for: `getContextUsage` rejecting
+  // used to return `model: null` and hand the session back the freshly-computed
+  // default, reopening issue #845 exactly when the session was least healthy.
+  //
+  // Parallel, not sequential, because the two are independent and only one of
+  // them is slow. It does NOT make the load faster: `Promise.allSettled`
+  // finishes with the control request, so the critical path is still whatever
+  // that costs. Taking the request OFF the path is the next step and it is not
+  // taken here, because this fork reads THREE values out of that one response
+  // — model, `rawMaxTokens` and `totalTokens` — and the window and occupancy
+  // have no second source. Upstream could drop the call in #1089 because it
+  // only ever wanted the model. Deferring the other two means letting
+  // `session/load` answer with the default window and correcting it a turn
+  // later, which is a UX decision backed by a measurement nobody has taken;
+  // the `SessionTiming` phases below are what that measurement would read.
+  const [transcript, usageResult] = await Promise.allSettled([
+    sessionId ? readResumedSession(sessionId, logger) : Promise.resolve<ResumedSessionSnapshot>({}),
+    query.getContextUsage(),
+  ]);
+
+  const timing = sessionId ? new SessionTiming(logger, "resume-model", sessionId) : null;
+  const transcriptModel =
+    transcript.status === "fulfilled" ? (transcript.value.model ?? null) : null;
+  timing?.phase(
+    "read-transcript",
+    ` model=${transcriptModel ?? "unknown"} outcome=${transcript.status}`,
+  );
+
+  if (usageResult.status === "rejected") {
+    timing?.phase("context-usage", " outcome=rejected");
+    logger.error("Failed to read the resumed session's live model:", usageResult.reason);
+    // The transcript still answers the model even though the report did not.
     return {
-      model: usage.model ? matchResumedModel(models, usage.model) : null,
+      model: transcriptModel ? matchResumedModel(models, transcriptModel) : null,
+      contextWindow: null,
+      contextUsedTokens: null,
+    };
+  }
+
+  const usage = usageResult.value;
+  timing?.phase("context-usage", ` model=${usage.model ?? "unknown"}`);
+  {
+    return {
+      // Transcript first: both name the same running model, and the transcript
+      // is the record the CLI itself resumes from.
+      model:
+        (transcriptModel ? matchResumedModel(models, transcriptModel) : null) ??
+        (usage.model ? matchResumedModel(models, usage.model) : null),
       contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
       // Deliberately NOT the `> 0` test the window uses: the two zeros say
       // different things. A window of zero tokens is not a window, so 0 there
@@ -8811,9 +8862,6 @@ async function readResumedLiveModel(
       contextUsedTokens:
         Number.isFinite(usage.totalTokens) && usage.totalTokens >= 0 ? usage.totalTokens : null,
     };
-  } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null, contextUsedTokens: null };
   }
 }
 
@@ -8832,6 +8880,11 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
+  /** The resumed session's id, when this IS a resume. Carried only so the
+   *  local transcript can be read for the live model; `isResumedSession` stays
+   *  the flag every branch below tests, because a caller may legitimately know
+   *  it is resuming without having an id to hand. */
+  resumedSessionId?: string,
 ): Promise<{
   modelState: SessionModelState;
   resumedContextWindow: number | null;
@@ -8885,7 +8938,7 @@ async function getAvailableModels(
   // the SDK is already running this model, and pushing a picker alias back
   // (e.g. "opus[1m]") could change the live model rather than describe it.
   if (resolvedFromInput === undefined && isResumedSession) {
-    const live = await readResumedLiveModel(query, models, logger);
+    const live = await readResumedLiveModel(query, models, logger, resumedSessionId);
     currentModel = live.model ?? currentModel;
     resumedContextWindow = live.contextWindow;
     resumedContextUsedTokens = live.contextUsedTokens;
@@ -8921,7 +8974,7 @@ async function getAvailableModels(
       // pin the session isn't running.
       if (!isResumedSession) throw error;
       logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      const live = await readResumedLiveModel(query, models, logger);
+      const live = await readResumedLiveModel(query, models, logger, resumedSessionId);
       currentModel = live.model ?? currentModel;
       resumedContextWindow = live.contextWindow;
       resumedContextUsedTokens = live.contextUsedTokens;

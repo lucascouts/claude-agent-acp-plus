@@ -321,4 +321,59 @@ describe("a resumed session's context ring starts where the session left off (B3
     await vi.waitFor(() => expect(quotaUpdates(notifications).length).toBeGreaterThan(0));
     expect(quotaUpdates(notifications)).toEqual([{ used: 0, size: 200_000 }]);
   });
+
+  /**
+   * Ported half of upstream #1089 (`fix: restore session forks and speed up
+   * loading`), and the half this fork could take.
+   *
+   * Upstream removed the `getContextUsage` call outright, because the model was
+   * the only thing it wanted from that response. This fork reads THREE values
+   * out of it — the model, `rawMaxTokens` and `totalTokens` — and the window
+   * and occupancy have no second source, so the request stays. What was taken
+   * is the local transcript as the model's FIRST source, read in parallel with
+   * the request rather than instead of it.
+   *
+   * That changes exactly one observable thing, and it is the case above: when
+   * the report rejects, the session used to fall back to the freshly-computed
+   * default model, reopening issue #845 at the moment the session was least
+   * healthy. The transcript is the same field Claude Code itself restores a
+   * resumed query from, it is a file read rather than IPC, and it still answers.
+   *
+   * The request COUNT is unchanged and this suite's premise survives: a second
+   * control request on the session/load path would be the cure worse than the
+   * disease (issues #886/#880), and a file read is not one.
+   */
+  it("restores the model from the transcript when the report rejects (upstream #1089)", async () => {
+    // TWO models, and the resumed one is NOT models[0]. With a single-model
+    // catalog this test passes against the old behaviour too -- the default and
+    // the transcript's answer are the same string, so nothing is being
+    // discriminated. Verified by reverting the change and watching it stay
+    // green; the second model is what makes it go red.
+    const OTHER_MODEL = { ...MODEL, value: "claude-opus-4-6", displayName: "Claude Opus" };
+    const getContextUsage = vi.fn(async () => {
+      throw new Error("get_context_usage control request failed");
+    });
+    // A transcript whose last real assistant record names the live model.
+    getSessionMessagesSpy.mockResolvedValueOnce([
+      { type: "assistant", message: { model: OTHER_MODEL.value } },
+    ]);
+    installQuery({
+      getContextUsage,
+      initializationResult: async () => ({ models: [MODEL, OTHER_MODEL] }),
+    });
+    const agent = await makeAgent();
+
+    await expect(
+      agent.loadSession({ sessionId: SESSION_ID, cwd: projectDir, mcpServers: [] }),
+    ).resolves.toBeDefined();
+
+    // The model survives the failed report -- this is the whole point. Before
+    // the port this was MODEL.value, the freshly-computed default (models[0]).
+    expect(agent.sessions[SESSION_ID]?.models.currentModelId).toBe(OTHER_MODEL.value);
+    // And the request was still made: the window and occupancy still need it,
+    // and exactly once.
+    expect(getContextUsage).toHaveBeenCalledTimes(1);
+    // Which is why those two are still absent when it fails.
+    expect(agent.sessions[SESSION_ID]?.contextUsedTokens).toBeUndefined();
+  });
 });
