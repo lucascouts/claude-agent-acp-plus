@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.16.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.2...v0.16.0) (2026-09-12)
+
+
+### Features
+
+* **resume:** read the live model from the transcript, not only from the report ([8e7a783](https://github.com/lucascouts/claude-agent-acp-plus/commit/8e7a783707f948235c5afb372837143da5b28c1b))
+
+
+### Continuous Integration
+
+* local exit 0 -- 1196 passed, 31 skipped. ([8e7a783](https://github.com/lucascouts/claude-agent-acp-plus/commit/8e7a783707f948235c5afb372837143da5b28c1b))
+
 ## [0.15.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.1...v0.15.2) (2026-09-11)
 
 
