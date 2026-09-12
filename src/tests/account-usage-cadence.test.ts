@@ -257,7 +257,14 @@ describe("the structured usage report is requested at both borders, and while id
     } else {
       process.env.XDG_RUNTIME_DIR = savedRuntimeDir;
     }
-    await fsp.rm(runtimeDir, { recursive: true, force: true });
+    // `rm` lists the directory, unlinks what it found, then rmdirs -- and the write
+    // it races with is `void writeLimits(report)` in acp-agent.ts, fire-and-forget by
+    // design, so no test can await it. A `rename` landing between the unlink and the
+    // rmdir leaves the directory non-empty, and the teardown throws ENOTEMPTY on a
+    // case whose every assertion passed. Reproduced 1 run in 8 locally; it is what
+    // failed the 0.16.0 release PR on code that was green on main. The retries are
+    // Node's own answer to exactly this -- ENOTEMPTY and EBUSY are in their contract.
+    await fsp.rm(runtimeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
 
   it("issues exactly one request when the session is established (R1.1)", async () => {
