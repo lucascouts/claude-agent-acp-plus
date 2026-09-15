@@ -9204,6 +9204,7 @@ describe("memory_recall handling", () => {
     expect(toolCall.update).toMatchObject({
       sessionUpdate: "tool_call",
       toolCallId: recallUuid,
+      name: "memory_recall",
       title: "Recalled 3 memories",
       kind: "read",
       status: "completed",
