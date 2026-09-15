@@ -1158,7 +1158,9 @@ export type ToolUpdateMeta = {
      `_meta` rather than ACP's own `compaction_update` variant. */
   contextCompaction?: ContextCompactionMetadata;
   claudeCode?: {
-    /* The name of the tool that was used in Claude Code. */
+    /* The name of the tool that was used in Claude Code. Also carried as the
+       standard ACP `name` field on the initial `tool_call`; kept here so every
+       `tool_call_update` stays self-describing for clients that key off it. */
     toolName: string;
     /* A human-readable title supplied by Claude Code for the tool call. */
     title?: string;
@@ -3838,6 +3840,9 @@ export class ClaudeAcpAgent {
                   update: {
                     sessionUpdate: "tool_call",
                     toolCallId: message.uuid,
+                    // Synthesized, but still this call's first report, so it
+                    // carries the standard `name` like any other initial one.
+                    name: "memory_recall",
                     title,
                     kind: "read",
                     status: "completed",
@@ -9316,7 +9321,10 @@ function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
  *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
  *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
  *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
- *  updates key off of; a refining `tool_call_update` carries neither. */
+ *  updates key off of, and the programmatic tool `name` (ACP's tool-call-name
+ *  RFD); a refining `tool_call_update` carries none of these. `name` is set
+ *  once at first report — on a v1 update, omitting it means "unchanged", and
+ *  the tool behind a `toolCallId` never changes. */
 function toolCallNotification(
   toolUse: { id: string; name: string; input: unknown },
   rawInput: unknown,
@@ -9342,6 +9350,7 @@ function toolCallNotification(
     } satisfies ToolUpdateMeta,
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call",
+    name: toolUse.name,
     rawInput,
     status: "pending",
     ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
