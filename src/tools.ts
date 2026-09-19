@@ -1368,6 +1368,14 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
         oldText.push(line.slice(1));
       } else if (line.startsWith("+")) {
         newText.push(line.slice(1));
+      } else if (line === "\\ No newline at end of file") {
+        // A unified-diff EOF marker, not a line of the file. Falling through to
+        // the context branch below strips its leading backslash and pushes
+        // " No newline at end of file" into BOTH sides, so the client renders
+        // the marker as file content in the diff view. Upstream #1122 skips it;
+        // its other half publishes `_meta.jetbrains.air.diffStats`, which no
+        // client this adapter serves reads, and is deliberately not taken.
+        continue;
       } else {
         oldText.push(line.slice(1));
         newText.push(line.slice(1));

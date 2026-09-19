@@ -1471,6 +1471,38 @@ describe("toolUpdateFromDiffToolResponse", () => {
     });
   });
 
+  // Regression: `\\ No newline at end of file` is a unified-diff marker, not a
+  // line of the file. It starts with neither "-" nor "+", so the context branch
+  // used to slice its backslash off and push " No newline at end of file" into
+  // BOTH sides -- the client then rendered the marker as file content. Upstream
+  // #1122 skips it; only that half is taken here (see tools.ts).
+  it("omits the EOF marker from both sides of the diff", () => {
+    const toolResponse = {
+      filePath: "/Users/test/project/test.txt",
+      structuredPatch: [
+        {
+          oldStart: 1,
+          oldLines: 2,
+          newStart: 1,
+          newLines: 2,
+          lines: [" context", "-old line", "\\ No newline at end of file", "+new line"],
+        },
+      ],
+    };
+
+    expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({
+      content: [
+        {
+          type: "diff",
+          path: "/Users/test/project/test.txt",
+          oldText: "context\nold line",
+          newText: "context\nnew line",
+        },
+      ],
+      locations: [{ path: "/Users/test/project/test.txt", line: 1 }],
+    });
+  });
+
   it("should build multiple diff content blocks for replaceAll with multiple hunks", () => {
     const toolResponse = {
       filePath: "/Users/test/project/file.ts",
