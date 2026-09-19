@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.18.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.17.0...v0.18.0) (2026-09-19)
+
+
+### Features
+
+* **permissions:** honour the CLI's defaultToNo and suppressAlwaysAllowRule ([170cb69](https://github.com/lucascouts/claude-agent-acp-plus/commit/170cb69218b211d166280eef55fea79637f459be))
+
+
+### Bug Fixes
+
+* **diff:** stop rendering the EOF marker as a line of the file ([ab35925](https://github.com/lucascouts/claude-agent-acp-plus/commit/ab35925ff8602675d3cadb4cefb51bd06118c615))
+* **permissions:** show the shell command being approved, not its description ([52719aa](https://github.com/lucascouts/claude-agent-acp-plus/commit/52719aad2beb36449b7c901413ebd94cb2986db2))
+
+
+### Miscellaneous Chores
+
+* **deps:** bump the minor group across 1 directory with 26 updates ([#99](https://github.com/lucascouts/claude-agent-acp-plus/issues/99)) ([ca005a7](https://github.com/lucascouts/claude-agent-acp-plus/commit/ca005a79d8f625b5d40726ca6a0615faf7788922))
+
 ## [0.17.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.16.0...v0.17.0) (2026-09-19)
 
 
