@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.17.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.16.0...v0.17.0) (2026-09-19)
+
+
+### Features
+
+* **tools:** carry the standard ACP `name` on the initial tool_call ([ffac107](https://github.com/lucascouts/claude-agent-acp-plus/commit/ffac107bbccdb1aa6dcb2cb99d451aa4be586d0f))
+
+
+### Bug Fixes
+
+* **replay:** strip injected system reminders from replayed prompts ([3cb0462](https://github.com/lucascouts/claude-agent-acp-plus/commit/3cb0462284b4f45d4de28b724cc654dc7d759ec3))
+
+
+### Miscellaneous Chores
+
+* **deps:** raise the agent SDK pin to 0.3.263 ([56d51e3](https://github.com/lucascouts/claude-agent-acp-plus/commit/56d51e3a6ab61c17f18d92905b6d5ab42d58097b))
+
 ## [0.16.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.15.2...v0.16.0) (2026-09-12)
 
 
