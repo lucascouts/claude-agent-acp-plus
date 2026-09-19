@@ -2744,8 +2744,11 @@ describe("permission request cancellation", () => {
       { kind: "allow_once", name: "Yes", optionId: "allow-once" },
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
+    // The command itself, not the tool name: a shell approval shows what will
+    // run (upstream #1070). `{ command: "ls" }` carries no description, and the
+    // canonical Bash title is the command.
     expect(request?._meta).toEqual({
-      permission: { version: 1, title: "Bash" },
+      permission: { version: 1, title: "ls" },
     });
   });
 
