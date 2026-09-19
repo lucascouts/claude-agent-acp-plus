@@ -103,6 +103,26 @@ describe("Claude permission ACP v1 presentation", () => {
     });
   });
 
+  it("forwards the CLI's defaultToNo hint in the permission record", () => {
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Bash",
+      input: { command: "rm -rf build" },
+      toolUseID: "tool-1",
+      defaultToNo: true,
+    });
+    expect(presentation._meta).toEqual({
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
+    });
+    expect(
+      buildClaudePermissionPresentation({
+        toolName: "Bash",
+        input: { command: "rm -rf build" },
+        toolUseID: "tool-1",
+        defaultToNo: false,
+      })._meta,
+    ).toEqual({ permission: { version: 1, title: "rm -rf build" } });
+  });
+
   it("keeps command descriptions and decision reasons in their presentation fields", () => {
     const input = { command: "npm test", description: "Run the tests" };
     const presentation = buildClaudePermissionPresentation({

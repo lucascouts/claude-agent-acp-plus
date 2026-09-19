@@ -2784,6 +2784,77 @@ describe("permission request cancellation", () => {
     });
   });
 
+  // SDK 0.3.268+ hints on the CLI's safety-check asks (delete-class Bash
+  // rulings, Artifact publishes, ...): the always-allow rule it would write is
+  // broader than the ask, so no persistent option may be offered; and the ask
+  // must open on its decline option, so the reject options lead.
+  it("offers no always-allow option when the CLI suppresses the persistent rule", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      suppressAlwaysAllowRule: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
+    expect(request?._meta).toEqual({ permission: { version: 1, title: "rm -rf build" } });
+  });
+
+  it("leads with the reject option and forwards the hint when the CLI defaults to no", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      defaultToNo: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.kind)).toEqual([
+      "reject_once",
+      "allow_once",
+      "allow_always",
+    ]);
+    expect(request?._meta).toEqual({
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
+    });
+    expect(result).toMatchObject({ behavior: "deny" });
+  });
+
   it("maps explicit reject to deny while retaining Claude classification", async () => {
     const mockClient = {
       sessionUpdate: async () => {},
