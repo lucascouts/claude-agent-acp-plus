@@ -4814,6 +4814,53 @@ describe("stop reason propagation", () => {
     expect(agent.sessions["test-session"].sessionFailureState.active.has(warning.id)).toBe(false);
   });
 
+  it("says how long a no-response retry waited and will wait", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 1,
+        max_retries: 1,
+        retry_delay_ms: 0,
+        error_status: null,
+        error: "unknown",
+        // SDK 0.3.261+: the API sent no response headers within the first-byte
+        // window; the retry waits longer for them. Without the detail the
+        // title reads "attempt 1 of 1", which looks like a final failure.
+        no_response: { waited_ms: 180_000, retry_wait_ms: 600_000 },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "ok",
+      }),
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const warning = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    expect(warning).toEqual(
+      expect.objectContaining({
+        category: "connection",
+        severity: "warning",
+        title:
+          "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
+      }),
+    );
+  });
+
   it.each([
     ["missing envelope", {}],
     ["missing capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } }],

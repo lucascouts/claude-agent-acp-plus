@@ -4084,10 +4084,19 @@ export class ClaudeAcpAgent {
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               case "api_retry": {
+                // `no_response` (SDK 0.3.261+): the API sent no response headers
+                // within the first-byte window, so this retry waits longer for
+                // them. Say so -- "attempt 1 of 1" alone reads like a final
+                // failure, and the wait is what the user is about to sit
+                // through.
+                const seconds = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
+                const noResponse = message.no_response
+                  ? ` No response after ${seconds(message.no_response.waited_ms)}; waiting up to ${seconds(message.no_response.retry_wait_ms)}.`
+                  : "";
                 const title =
                   message.error_status === null
-                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.`
-                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.`;
+                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
+                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
                 await publishSessionFailure(
                   message.error_status === null
                     ? "transport_lost"
