@@ -34,6 +34,22 @@ updates:
       # Drop this once typescript-eslint/typescript-eslint#10940 closes.
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
+      # The Claude Agent SDK bundles the CLI, and the CLI has behaviour cliffs
+      # this adapter's turn accounting reasons from. CLI >=2.1.270 withholds
+      # `idle` while background agents run (upstream sweeps `owedTrailingIdles`
+      # at the `running` transition; this adapter does not carry that sweep) and
+      # CLI >=2.1.274 answers queued background completions with placeholder
+      # results. Crossing either is a port, not a bump: the chain's parity
+      # report schedules it "as an epic, not a merge", and warns that bumping
+      # the pin alone can hang a turn with background subagents.
+      #
+      # The unit suite cannot catch a crossing: the idle cadence comes from the
+      # doubles in src/tests/session-doubles.ts, so a bumped pin stays green.
+      # Dependabot PR #106 was merged on 2026-09-22 for exactly that reason and
+      # had to be reverted. The pin moves in a fork-sync story, with the fork
+      # leading — src/tests/deps.test.ts in the fork enforces that order.
+      - dependency-name: "@anthropic-ai/claude-agent-sdk"
+      - dependency-name: "@anthropic-ai/claude-agent-sdk-*"
     # Release cooldown: don't adopt a version published <7 days ago
     # (mitigates freshly-compromised releases).
     #
