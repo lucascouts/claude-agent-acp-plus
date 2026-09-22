@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.19.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.18.0...v0.19.0) (2026-09-22)
+
+
+### Features
+
+* **session-failure:** say what a no-response retry waited for, and for how long ([952bb10](https://github.com/lucascouts/claude-agent-acp-plus/commit/952bb10911ded6fe01cd360cf49960a2a517670c))
+* **turn:** sweep unpayable trailing-idle debt at the running transition ([253b9c8](https://github.com/lucascouts/claude-agent-acp-plus/commit/253b9c8d3ed582353e225ca4a65056dd226490ce))
+
+
+### Bug Fixes
+
+* **deps:** pin the agent SDK back to 0.3.269, below the CLI 2.1.270 cliff ([cddfd82](https://github.com/lucascouts/claude-agent-acp-plus/commit/cddfd82fc3c14266950bc020ef74aca5b6a0baef))
+
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump nanoid from 3.3.18 to 3.3.19 ([#103](https://github.com/lucascouts/claude-agent-acp-plus/issues/103)) ([4ccfb3c](https://github.com/lucascouts/claude-agent-acp-plus/commit/4ccfb3cc548ff4d01d220a0246e3716951d47713))
+* **deps-dev:** bump obug from 2.1.4 to 2.2.1 ([#104](https://github.com/lucascouts/claude-agent-acp-plus/issues/104)) ([6ee1755](https://github.com/lucascouts/claude-agent-acp-plus/commit/6ee1755fda6c0fdf59babc1cd8834be2212adaa0))
+* **deps:** bump fast-uri from 3.1.7 to 3.1.8 ([#109](https://github.com/lucascouts/claude-agent-acp-plus/issues/109)) ([e9824a8](https://github.com/lucascouts/claude-agent-acp-plus/commit/e9824a872fdbed7c3430615bd80ab87c488256fe))
+* **deps:** bump the actions group with 2 updates ([#105](https://github.com/lucascouts/claude-agent-acp-plus/issues/105)) ([d93a6eb](https://github.com/lucascouts/claude-agent-acp-plus/commit/d93a6ebde15b16202d6fc6b82455643067abc10d))
+* **deps:** bump the minor group across 1 directory with 14 updates ([#106](https://github.com/lucascouts/claude-agent-acp-plus/issues/106)) ([e1db876](https://github.com/lucascouts/claude-agent-acp-plus/commit/e1db8767abd1264a1409b6e4a4fb4b01e1fd9177))
+* **deps:** bump the minor group with 4 updates ([#108](https://github.com/lucascouts/claude-agent-acp-plus/issues/108)) ([2c879ff](https://github.com/lucascouts/claude-agent-acp-plus/commit/2c879ffd2a8ac5252913f3043169860a559631f9))
+
+
+### Continuous Integration
+
+* **dependabot:** stop proposing agent SDK bumps, which are ports not bumps ([af10bdd](https://github.com/lucascouts/claude-agent-acp-plus/commit/af10bdd6c9796450c3a45c7e769c6a8dc44fc2da))
+
 ## [0.18.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.17.0...v0.18.0) (2026-09-19)
 
 
