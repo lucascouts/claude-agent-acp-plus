@@ -458,10 +458,14 @@ type Turn = {
    *  issue #866), and the model's task-notification followup summary all
    *  land inside the turn.
    *
-   *  The CLI does NOT hold its trailing idle for background agents (observed
-   *  on 2.1.206: `idle` follows the result immediately while the subagent
-   *  still runs), so the hold spans multiple idle cycles: user result →
-   *  idle → (subagent works) → task_notification → followup turn → idle.
+   *  Idle cadence depends on the CLI. Through 2.1.269 the trailing idle is
+   *  NOT held for background agents (observed on 2.1.206: `idle` follows the
+   *  result immediately while the subagent still runs), so the hold spans
+   *  multiple idle cycles: user result → idle → (subagent works) →
+   *  task_notification → followup turn → idle. From 2.1.270 the CLI stays
+   *  `running` while background agents live (user result →
+   *  task_notification → followup turn → ONE idle), so the user result's
+   *  idle debt goes unpaid — swept at the next `running` transition.
    *  The stored outcome (the result's stop reason and usage snapshot) is
    *  what the turn settles with once its spawned subagents have settled —
    *  at the followup's terminal result (the summary has streamed by then),
@@ -3689,7 +3693,36 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "session_state_changed": {
+                const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
+                if (
+                  message.state === "running" &&
+                  previousState !== "running" &&
+                  session.owedTrailingIdles > 0
+                ) {
+                  // A transition INTO `running` proves the idle period before
+                  // it ended: every idle the CLI was going to emit for earlier
+                  // results has been emitted, so debt still outstanding here
+                  // can never be paid. (A repeated `running` is not a
+                  // transition and is left alone.)
+                  //
+                  // The debt only survives to this point under CLI 2.1.270+,
+                  // which withholds `idle` while background agents run --
+                  // user result -> task_notification -> followup result -> ONE
+                  // idle -- so a held turn's own result leaves one unpaid unit
+                  // per hold. Through 2.1.269 the idle follows the result
+                  // immediately and the debt is already zero here, which is
+                  // why this sweep is safe to carry on both cadences.
+                  //
+                  // Left in place, each unit would absorb a later un-owed idle
+                  // -- masking an issue-#825 detection -- or swallow the idle a
+                  // steered turn settles on (the owed-idle branch runs before
+                  // the steer lane), hanging that prompt.
+                  this.logger.log(
+                    `[turn/idle-debt] swept=${session.owedTrailingIdles} session=${params.sessionId} at=running-transition`,
+                  );
+                  session.owedTrailingIdles = 0;
+                }
                 if (message.state === "idle") {
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
@@ -3734,14 +3767,16 @@ export class ClaudeAcpAgent {
                     session.emittedAssistantText = false;
                   } else if (isHeldOpen(session.activeTurn)) {
                     // A turn held open for its background subagents (see
-                    // Turn.deferredSettle). Idles keep their normal cadence
-                    // during the hold — the CLI emits one per processing
-                    // cycle (the turn's own trailer, then one per followup),
-                    // NOT one final "all drained" signal — so each one
-                    // absorbs an outstanding trailer debt, and the turn only
-                    // settles once none of its spawned subagents is left
-                    // (the followup-result settle usually got there first;
-                    // this is the fallback when no followup came). Mid-hold
+                    // Turn.deferredSettle). Idle cadence during the hold
+                    // depends on the CLI: through 2.1.269 one idle per
+                    // processing cycle (the turn's own trailer, then one per
+                    // followup); from 2.1.270 none until the background agents
+                    // drain, then one. Either way each idle absorbs an
+                    // outstanding trailer debt (the unpayable remainder is
+                    // swept at the next `running` transition above), and the
+                    // turn only settles once none of its spawned subagents is
+                    // left (the followup-result settle usually got there
+                    // first; this is the fallback when no followup came). Mid-hold
                     // idles never fall through: a held turn HAS its result,
                     // so reading its idle as "turn abandoned without a
                     // result" (issue #825) would fail a healthy prompt.

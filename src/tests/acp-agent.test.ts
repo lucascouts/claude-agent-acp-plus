@@ -12220,6 +12220,60 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("settles under the 2.1.270 cadence and sweeps the unpaid idle debt at the next running", async () => {
+    // The cadence this adapter was written against (<=2.1.269) pays one idle
+    // per processing cycle. From 2.1.270 the CLI stays `running` while the
+    // subagent lives and emits ONE idle for both results, so the user
+    // result's debt is never paid -- and a debt carried into the next turn
+    // absorbs an idle that turn needed. The sweep at the `running` transition
+    // is what keeps the second prompt from hanging.
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield userEcho(first);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage();
+        // No idle here: under 2.1.270 the CLI is still `running` for the live
+        // subagent. This single omission is the whole behaviour change.
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle(); // one idle for both results
+        const { value: second } = await iter.next();
+        yield userEcho(second);
+        yield running();
+        yield assistantText("second answer");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const session = () => agent.sessions["test-session"]!;
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    expect(events.indexOf("chunk:promised summary")).toBeGreaterThanOrEqual(0);
+    // Two results, one idle: one unit of debt is left over.
+    await waitFor(() => session().owedTrailingIdles === 1);
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "again" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    // The `running` transition swept the stale unit, so the second turn's own
+    // idle leaves nothing outstanding.
+    await waitFor(() => session().owedTrailingIdles === 0);
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("turn steering (_session/steering)", () => {
