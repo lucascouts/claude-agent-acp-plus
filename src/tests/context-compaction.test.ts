@@ -392,6 +392,19 @@ describe("no compaction survives an interruption - the agent's own paths", () =>
       await gate;
       yield* after;
     }
+    // The account-quota publish is stubbed out for every case in this block, and
+    // it is isolation rather than convenience. A turn that reaches the `result`
+    // case's `finally` calls publishAccountUsage, which reads and writes a quota
+    // sample SHARED ON DISK between processes -- so a compaction case driving a
+    // real turn writes a sample that account-usage-cadence.test.ts then reads,
+    // in a different vitest worker. Measured: adding one more result-yielding
+    // case here turned that file's "reuses a sample another process already paid
+    // for" red with 0.42 where it expected 0.99, while both files stayed green
+    // run alone and green at HEAD. The existing conversation-reset case was
+    // passing on luck, not on isolation.
+    (agent as unknown as { publishAccountUsage: () => Promise<void> }).publishAccountUsage =
+      async () => {};
+    (agent as unknown as { armAccountUsagePolling: () => void }).armAccountUsagePolling = () => {};
     agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(generator()), input });
 
     return {
@@ -458,6 +471,44 @@ describe("no compaction survives an interruption - the agent's own paths", () =>
 
     await h.agent.cancel({ sessionId: "test-session" } as any);
     await settled;
+
+    expect(stillOpen(h.toolCalls())).toEqual([]);
+  });
+
+  it("a turn whose result is an error closes it", async () => {
+    // Found by audit, not by the plan.
+    //
+    // WHAT THIS CASE PROVES, exactly: with all three of the audit's sites
+    // removed -- failActiveWithSessionFailure, the result case's `finally`, and
+    // the consumer's outer catch -- it goes red with
+    // `expected [ 'compact-start' ] to deeply equal []`. With any one of them
+    // present it is green, so it proves the three COLLECTIVELY and isolates
+    // none.
+    //
+    // AND IT IS NOT THE ONE YOU WOULD GUESS. Removing only the `finally`'s
+    // interrupt leaves this case green, measured: an `is_error` result routes
+    // through failActiveWithSessionFailure, which closes it first. So the
+    // `finally` site is defended by reasoning and not by this case -- it is the
+    // one point every exit from that case passes through, and an arm reaching it
+    // without a terminal (a refusal) would hit `compaction.reset()`, which sends
+    // nothing. That arm has no case here; saying so is cheaper than implying it
+    // does.
+    const h = heldTurn(
+      [compactingStatus],
+      [
+        successfulResultMessage({
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "boom",
+        }),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+    );
+    const settled = h.prompt();
+    await awaitCompactionAnnounced(h);
+
+    h.release();
+    await settled.catch(() => undefined);
 
     expect(stillOpen(h.toolCalls())).toEqual([]);
   });

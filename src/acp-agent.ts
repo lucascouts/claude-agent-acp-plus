@@ -3210,6 +3210,10 @@ export class ClaudeAcpAgent {
       error: unknown,
       title?: string,
     ) => {
+      // Both arms below end the turn, and neither reports a terminal for a
+      // compaction that was open when the provider failed. Ahead of the
+      // capability branch for that reason, and a no-op when nothing is open.
+      await compaction.interrupt(params.sessionId);
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
         failActive(error);
         return;
@@ -4756,6 +4760,15 @@ export class ClaudeAcpAgent {
                 // rather than at idle: an owed idle from this turn can arrive
                 // after the next turn has already started, and would erase that
                 // turn's compaction state instead of its own.
+                //
+                // interrupt() FIRST, and unconditionally: this `finally` is the
+                // one point every exit from this case passes through, and the
+                // arms that reach it without a terminal -- `auth_required`,
+                // `is_error`, a refusal -- would otherwise leave the opening
+                // in_progress frame as the client's last word, because reset()
+                // sends nothing. A successful result has already reported its
+                // own terminal, so this is a no-op there.
+                await compaction.interrupt(params.sessionId);
                 compaction.reset();
                 // R1.2: a user turn's terminal result is the moment consumption
                 // actually changed, so refresh the account quota windows here —
@@ -5389,6 +5402,10 @@ export class ClaudeAcpAgent {
       if (session.query !== myQuery) {
         return;
       }
+      // The stream died, so no terminal for an open compaction is coming.
+      // After the supersession guard, never before it: a superseded consumer
+      // must not send anything on the live consumer's behalf.
+      await compaction.interrupt(params.sessionId);
       // The query stream itself died (a transport/process error surfaced from
       // query.next()). Turn-level failures (auth, error results) are handled
       // inline via failActive and never reach here. Reject every in-flight turn;
