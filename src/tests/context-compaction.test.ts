@@ -224,6 +224,274 @@ describe("ContextCompactionLifecycle - one shape per event", () => {
   });
 });
 
+/**
+ * Upstream a05aca6 (#1154): "force cancellation could return
+ * `stopReason: cancelled` while leaving the compaction `in_progress`". Upstream
+ * fixed it with one shared idempotent cleanup across six call sites. None of
+ * those call sites exists here as written -- this fork reports compaction on a
+ * synthetic tool call carrying `_meta.contextCompaction`, not on ACP's native
+ * `compaction_update` -- so whether the same leak exists here is a question
+ * about THIS code, and these cases are the answer.
+ *
+ * WHAT "LEFT OPEN" MEANS, and why it is phrased over frames. There is no public
+ * observable for an open compaction: `activeCompaction` is private, and the
+ * lifecycle is a `const` local inside the consumer, unreachable from the
+ * session. The only thing outside the class that can see anything is the update
+ * stream -- which is also the only thing a CLIENT can see, so it is the right
+ * place for the assertion rather than a concession. `reset()` emits nothing, so
+ * the three paths that do call it still leave the last frame the client saw at
+ * `in_progress` forever: a compaction row that spins for the rest of the session.
+ *
+ * WHY THIS GOES BEYOND UPSTREAM, deliberately. Upstream's own `interrupt()`
+ * leaves its legacy tool-call presentation untouched, saying so in as many
+ * words: ACP `ToolCallStatus` has no `cancelled` state. This fork has only that
+ * presentation -- and, unlike upstream, it has a downstream reader for the
+ * terminal. Patch 0017 maps `acp::ToolCallStatus::Failed` to
+ * `ContextCompactionStatus::Canceled` precisely because the crate's enum has no
+ * failure state. So a terminal `failed` here is not an invented convention: it
+ * is the one the other half of this chain was already built to receive.
+ */
+describe("no compaction survives an interruption (#1154)", () => {
+  /**
+   * The invariant, read off the wire: every tool call that was announced
+   * `in_progress` must later carry a terminal status under the same id.
+   *
+   * Written as a fold rather than "the last frame is terminal" on purpose -- two
+   * compactions in one turn are two ids, and a suite that only looked at the
+   * last frame would call the first one closed because the second one closed.
+   */
+  function stillOpen(updates: Update[]): string[] {
+    const open = new Set<string>();
+    for (const update of updates) {
+      if (!isToolUpdate(update)) continue;
+      if (update.status === "in_progress") open.add(update.toolCallId);
+      else if (update.status !== undefined) open.delete(update.toolCallId);
+    }
+    return [...open];
+  }
+
+  // --- the lifecycle's own contract ----------------------------------------
+
+  it("interrupt closes an open compaction on the wire, not just in memory", async () => {
+    const { updates, sendUpdate } = capture();
+    const lifecycle = new ContextCompactionLifecycle(sendUpdate);
+
+    await lifecycle.start("test-session", "compact-1");
+    expect(stillOpen(updates)).toEqual(["compact-1"]);
+
+    await lifecycle.interrupt("test-session");
+
+    expect(stillOpen(updates)).toEqual([]);
+    expect(updates.at(-1)).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "compact-1",
+      status: "failed",
+      // Distinguishable from a compaction that genuinely failed. The field is
+      // the adapter's existing vocabulary for exactly this -- "why the tool
+      // never actually ran, so a client can render the cancellation distinctly
+      // from a real tool failure" -- and without it the two are one status.
+      _meta: { claudeCode: { nonExecutionKind: "interrupted" } },
+    });
+  });
+
+  it("HOSTILE - reset alone leaves the client looking at in_progress forever", async () => {
+    // The characterisation that says why interrupt() has to exist. The existing
+    // reset case calls it on an ALREADY-TERMINAL lifecycle, so it never observed
+    // this; reset drops the reference without sending anything, and the frame it
+    // abandons is the one the client is still rendering.
+    const { updates, sendUpdate } = capture();
+    const lifecycle = new ContextCompactionLifecycle(sendUpdate);
+
+    await lifecycle.start("test-session", "compact-1");
+    lifecycle.reset();
+
+    expect(stillOpen(updates)).toEqual(["compact-1"]);
+  });
+
+  it("interrupt is idempotent, and silent when there is nothing open", async () => {
+    // It is called from several paths that can run in sequence for one turn, so
+    // a second call must not add a second terminal -- the same duplicate-guard
+    // the SDK's repeated terminals already get.
+    const { updates, sendUpdate } = capture();
+    const lifecycle = new ContextCompactionLifecycle(sendUpdate);
+
+    await lifecycle.interrupt("test-session");
+    expect(updates).toHaveLength(0);
+
+    await lifecycle.start("test-session", "compact-1");
+    await lifecycle.interrupt("test-session");
+    await lifecycle.interrupt("test-session");
+    expect(updates.filter((u) => u.status === "failed")).toHaveLength(1);
+
+    await lifecycle.start("test-session", "compact-2");
+    await lifecycle.finish("test-session", "compact-2", "completed");
+    await lifecycle.interrupt("test-session");
+    expect(updates.filter((u) => u.status === "completed")).toHaveLength(1);
+    expect(stillOpen(updates)).toEqual([]);
+  });
+});
+
+/**
+ * The same invariant, driven through the agent's own interruption paths. The
+ * block above proves the lifecycle CAN close itself; these prove each path
+ * actually asks it to, which is the half a unit test cannot reach -- the
+ * lifecycle is a `const` local inside the consumer, so nothing but the agent
+ * can call it, and nothing but the update stream can see that it did.
+ *
+ * Four paths, named because upstream's six do not map onto this fork:
+ * an ordinary cancel that reaches its trailing idle, a force cancellation that
+ * never does, the SDK stream ending mid-compaction, and a conversation reset
+ * arriving while one is open.
+ */
+describe("no compaction survives an interruption - the agent's own paths", () => {
+  function stillOpen(updates: Update[]): string[] {
+    const open = new Set<string>();
+    for (const update of updates) {
+      if (!isToolUpdate(update)) continue;
+      if (update.status === "in_progress") open.add(update.toolCallId);
+      else if (update.status !== undefined) open.delete(update.toolCallId);
+    }
+    return [...open];
+  }
+
+  const compactingStatus = {
+    type: "system",
+    subtype: "status",
+    status: "compacting",
+    uuid: "compact-start",
+    session_id: "test-session",
+  };
+
+  /**
+   * A turn that stops mid-compaction and stays there until the case lets it go.
+   * `before` is yielded, then the generator waits on the gate; `after` is what
+   * the SDK still has to say once the case releases it -- empty for the paths
+   * where the point is that it never says anything more.
+   */
+  function heldTurn(before: any[], after: any[] = []) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const input = new Pushable<any>();
+    async function* generator() {
+      const user = await input[Symbol.asyncIterator]().next();
+      yield userEcho(user.value);
+      yield* before;
+      await gate;
+      yield* after;
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(generator()), input });
+
+    return {
+      agent,
+      updates,
+      release,
+      toolCalls: () => updates.map((u) => u.update as unknown as Update).filter(isToolUpdate),
+      prompt: () =>
+        agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] }),
+    };
+  }
+
+  /**
+   * Wait until the opening `in_progress` frame has actually been SENT.
+   *
+   * Deliberately not "until a compaction is currently open": the conversation
+   * reset is handled in the same drain as the frame that opened the compaction,
+   * so on that path there is no window in which one is open, and a helper
+   * waiting for one timed out and looked like the compaction never started.
+   */
+  async function awaitCompactionAnnounced(h: ReturnType<typeof heldTurn>) {
+    for (let i = 0; i < 200; i++) {
+      if (h.toolCalls().some((update) => update.toolCallId === "compact-start")) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("the compaction was never announced");
+  }
+
+  it("the SDK stream ending mid-compaction closes it", async () => {
+    const h = heldTurn([compactingStatus]);
+    const settled = h.prompt();
+    await awaitCompactionAnnounced(h);
+
+    h.release();
+    await settled;
+
+    expect(stillOpen(h.toolCalls())).toEqual([]);
+  });
+
+  it("an ordinary cancel that reaches its trailing idle closes it", async () => {
+    const h = heldTurn(
+      [compactingStatus],
+      [{ type: "system", subtype: "session_state_changed", state: "idle" }],
+    );
+    const settled = h.prompt();
+    await awaitCompactionAnnounced(h);
+
+    await h.agent.cancel({ sessionId: "test-session" } as any);
+    h.release();
+    await settled;
+
+    expect(stillOpen(h.toolCalls())).toEqual([]);
+  });
+
+  it("a force cancellation that never reaches an idle closes it", async () => {
+    // The upstream defect verbatim: stopReason `cancelled` returned while the
+    // compaction is left in_progress. The grace timer is cut to a few ms so the
+    // abort races in instead of the trailing idle, which is the whole difference
+    // from the case above.
+    const h = heldTurn([compactingStatus]);
+    (h.agent as any).forceCancelGraceMs = 20;
+    const settled = h.prompt();
+    await awaitCompactionAnnounced(h);
+
+    await h.agent.cancel({ sessionId: "test-session" } as any);
+    await settled;
+
+    expect(stillOpen(h.toolCalls())).toEqual([]);
+  });
+
+  it("a conversation reset arriving mid-compaction closes it", async () => {
+    const h = heldTurn(
+      [
+        compactingStatus,
+        {
+          // A top-level message TYPE, not a `system` subtype -- the first
+          // version of this case spelled it as one, and the agent's switch
+          // silently ignored it, so the leak the case was written to catch
+          // looked exactly like the leak it was supposed to fix.
+          type: "conversation_reset",
+          new_conversation_id: "conversation-2",
+          uuid: "reset-1",
+          session_id: "test-session",
+        },
+      ],
+      [
+        successfulResultMessage(),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+    );
+    const settled = h.prompt();
+    await awaitCompactionAnnounced(h);
+
+    h.release();
+    await settled;
+
+    expect(stillOpen(h.toolCalls())).toEqual([]);
+  });
+});
+
 describe("the agent reports one compaction once", () => {
   function runTurn(messages: any[]) {
     const updates: SessionNotification[] = [];

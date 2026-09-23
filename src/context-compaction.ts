@@ -256,6 +256,54 @@ export class ContextCompactionLifecycle {
     });
   }
 
+  /**
+   * Close an open compaction because the TURN ended, not because the runtime
+   * reported an outcome: a cancel, a force cancellation, the SDK stream
+   * ending, a conversation reset.
+   *
+   * Idempotent, and silent when nothing is open, because several of those paths
+   * run in sequence for one turn -- the force-cancel backstop settles the turn
+   * and the SDK's late trailing idle then reaches the cancelled-turn branch,
+   * and both call this.
+   *
+   * WHY IT EMITS, WHERE `reset()` DOES NOT. `reset()` returns the lifecycle to
+   * its unstarted state and sends nothing, which is right at a turn boundary
+   * the runtime closed properly. It is wrong at an interruption: the last frame
+   * the client saw is the opening `in_progress`, and dropping the reference
+   * leaves that frame standing -- a compaction row that spins for the rest of
+   * the session. So this reports the terminal, and the caller still resets
+   * afterwards for the turn-boundary state.
+   *
+   * WHY `failed`, AND WHY THAT IS NOT UPSTREAM'S ANSWER. Upstream's own
+   * `interrupt()` (a05aca6, #1154) deliberately leaves a legacy tool-call
+   * presentation untouched, saying why in as many words: ACP `ToolCallStatus`
+   * has no `cancelled` state. This fork has ONLY that presentation -- and,
+   * unlike upstream, it has a downstream reader for the terminal. Patch `0017`
+   * maps `acp::ToolCallStatus::Failed` to `ContextCompactionStatus::Canceled`,
+   * the terminal the crate's enum offers that claims the least. So `failed`
+   * here is not an invented convention; it is the one the other half of this
+   * chain was already built to receive.
+   *
+   * `nonExecutionKind: "interrupted"` is what keeps it distinguishable from a
+   * compaction that genuinely failed. It is the adapter's existing field for
+   * "why the tool never actually ran", and without it the two are one status.
+   */
+  async interrupt(sessionId: string): Promise<void> {
+    const state = this.activeCompaction;
+    if (!state || state.terminalStatus) return;
+
+    state.terminalStatus = "failed";
+    await this.sendUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: state.toolCallId,
+        status: "failed",
+        _meta: compactionToolMeta({}, "interrupted"),
+      },
+    });
+  }
+
   /** Arm {@link consumeDuplicateErrorOutput} for the stdout copy Claude emits. */
   private rememberDuplicateErrorOutput(
     status: CompactionStatus,
@@ -305,10 +353,11 @@ const COMPACTION_TOOL_TITLE = "Compact conversation";
  */
 function compactionToolMeta(
   metadata: Omit<ContextCompactionMetadata, "version"> = {},
+  nonExecutionKind?: string,
 ): Record<string, unknown> {
   return {
     ...createContextCompactionMeta(metadata),
-    claudeCode: { toolName: "compact" },
+    claudeCode: { toolName: "compact", ...(nonExecutionKind ? { nonExecutionKind } : {}) },
   };
 }
 

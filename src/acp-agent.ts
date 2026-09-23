@@ -3352,6 +3352,11 @@ export class ClaudeAcpAgent {
               this.trackOrphanCommand(session, active.promptUuid, "started");
             }
           }
+          // #1154's own case: this settles the turn "cancelled" while the
+          // compaction the client is watching is still in_progress, and the
+          // SDK will never send its terminal because the backstop fired
+          // precisely because the SDK stopped answering.
+          await compaction.interrupt(params.sessionId);
           settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
@@ -3423,6 +3428,10 @@ export class ClaudeAcpAgent {
           // a deferred turn's stored outcome (followup results never mutate
           // it), but the stored one is the authoritative source.
           const inFlight = session.activeTurn;
+          // The stream is gone, so no terminal for an open compaction is ever
+          // coming; close it before the turn settles, or the frame outlives the
+          // query that would have finished it.
+          await compaction.interrupt(params.sessionId);
           settleActive(
             session.cancelled
               ? { stopReason: "cancelled", usage: sessionUsage(session) }
@@ -3758,6 +3767,11 @@ export class ClaudeAcpAgent {
                     // An interrupt can pre-empt the result entirely, so the
                     // lifecycle's own reset there never ran; close it here or a
                     // half-open compaction would leak into the next turn.
+                    //
+                    // reset() alone was not enough and looked like it was: it
+                    // drops the state without sending anything, so the opening
+                    // in_progress frame stayed the last word the client had.
+                    await compaction.interrupt(params.sessionId);
                     compaction.reset();
                     settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
                     // An interrupt can pre-empt the turn's result entirely
@@ -3822,7 +3836,10 @@ export class ClaudeAcpAgent {
                     !session.activeTurn.settled
                   ) {
                     // Same reason as the cancelled branch: this turn will never
-                    // reach the result that would have reset the lifecycle.
+                    // reach the result that would have reset the lifecycle, and
+                    // reset() sends nothing, so the terminal has to be reported
+                    // before the state is dropped.
+                    await compaction.interrupt(params.sessionId);
                     compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
@@ -5338,6 +5355,10 @@ export class ClaudeAcpAgent {
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
             session.taskState.clear();
+            // A compaction open on the OLD transcript can never terminate on
+            // the new one: the uuid its tool call is keyed by belongs to a
+            // conversation that no longer exists.
+            await compaction.interrupt(params.sessionId);
             await this.publishTaskPlan(params.sessionId, session.taskState);
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
             // cached title no longer describes the session: drop it and
