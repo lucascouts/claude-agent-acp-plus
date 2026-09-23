@@ -10,9 +10,30 @@ import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
  * is therefore no authoritative, machine-readable signal telling a host that a
  * model row has been retired.
  *
- * LAST VERIFIED AGAINST SDK 0.3.220 (story 008, R5.5) — the type is byte-for-byte
- * unchanged from 0.3.204/0.3.212, so the heuristic below is still necessary.
- * Re-check this claim on every SDK bump and update the version named here.
+ * LAST VERIFIED AGAINST SDK 0.3.273 (2026-09-23) — the `ModelInfo` field set is
+ * byte-for-byte unchanged from 0.3.204/0.3.212/0.3.220, so the heuristic below
+ * is still necessary. Re-check this claim on every SDK bump and update the
+ * version named here.
+ *
+ * Re-verified against the LIVE catalogue on the same date, on both sides of the
+ * 0.3.273 -> 0.3.280 bump: the heuristic flagged zero rows either time. The
+ * `deprecation heuristic removes zero rows from the live model catalog`
+ * integration test is the gate that keeps that true.
+ *
+ * **Do not write the expected row set down here.** That catalogue is served by
+ * the backend, not baked into the pinned CLI, and it was measured CHANGING
+ * UNDER A FIXED BUILD on 2026-09-23: the same adapter against the same CLI
+ * 2.1.280 returned 5 rows (`default`, `opus[1m]`, `claude-fable-5-1[1m]`,
+ * `sonnet`, `haiku`) and, roughly twenty minutes later, 11 — renamed, retagged,
+ * and carrying version-pinned legacy rows (`claude-opus-4-6` … `claude-opus-5`).
+ * An enumeration in a comment is therefore stale on a timescale of minutes,
+ * which is why the gate asserts a PROPERTY (nothing is flagged) and never a list.
+ *
+ * That volatility is also the heuristic's whole justification. The interactive
+ * CLI picker already labels retired rows `Opus 4.8 · Legacy`; the SDK catalogue
+ * currently sends the tier tagline instead, so nothing matches today. The day it
+ * sends the picker's copy, these rows start being filtered — with no code change
+ * and no warning. That is the heuristic working, not misfiring.
  *
  * As a stand-in this module scans the human-facing copy — `displayName` and
  * `description` — for the words "deprecated" or "legacy" (case-insensitive).

@@ -121,6 +121,7 @@ import {
 } from "./elicitation.js";
 import { agentName } from "./agent-name.js";
 import { filterDeprecatedModels } from "./model-deprecation.js";
+import { filterSupersededModels } from "./model-recency.js";
 import { SettingsManager } from "./settings.js";
 import { ContextCompactionMetadata } from "./context-compaction-meta.js";
 import {
@@ -7665,7 +7666,10 @@ export class ClaudeAcpAgent {
     // `catalogModels` is deliberate so the boundary stays the single place
     // filter and allowlist compose. Without an allowlist the raw SDK list is
     // the one list-building site that never crosses that boundary, so it
-    // applies the SAME `hideDeprecatedModels` helper directly.
+    // applies the SAME `hideDeprecatedModels` helper directly, plus
+    // `hideSupersededModels` — which the allowlist branch deliberately does NOT
+    // get, because an allowlist is the user naming versions on purpose (see
+    // that helper's doc).
     const allowedModels = Array.isArray(settingsAvailableModels)
       ? applyAvailableModelsAllowlist(
           initializationResult.models,
@@ -7673,7 +7677,10 @@ export class ClaudeAcpAgent {
           settingsModelOverrides,
           this.logger,
         )
-      : hideDeprecatedModels(initializationResult.models, this.logger);
+      : hideSupersededModels(
+          hideDeprecatedModels(initializationResult.models, this.logger),
+          this.logger,
+        );
 
     const {
       modelState: models,
@@ -8810,6 +8817,44 @@ function hideDeprecatedModels(models: ModelInfo[], logger?: Logger): ModelInfo[]
   if (visible.length === 0 && models.length > 0) {
     logger?.error(
       "Deprecation filter would hide every available model; showing the unfiltered list instead.",
+    );
+    return models;
+  }
+  return visible;
+}
+
+/**
+ * Recency filter for the DEFAULT picker list: drop rows
+ * {@link filterSupersededModels} finds to be an older generation of a family
+ * the catalogue also offers current, so the picker shows one choice per family
+ * rather than a version history.
+ *
+ * **Applied ONLY where no `availableModels` allowlist is configured**, which is
+ * the one place it differs from {@link hideDeprecatedModels}. The two look
+ * alike and the asymmetry is deliberate: a deprecated row is one the VENDOR
+ * retired, so hiding it even when an allowlist names it is doing the user a
+ * favour; a superseded row is one the user may have named ON PURPOSE — pinning
+ * `claude-opus-4-8` for reproducibility is a real thing to want, and silently
+ * returning fewer models than were asked for would make the setting a lie.
+ * Recency tidies a list nobody curated; it never overrides one somebody did.
+ *
+ * The two also answer different questions, and neither subsumes the other: the
+ * deprecation heuristic reads human-facing PROSE for a marker the vendor chose
+ * to write, this reads the VERSION and needs no such cooperation. Measured
+ * 2026-09-23, the live catalogue's six superseded rows (`claude-opus-4-6` …
+ * `claude-fable-5`) carried no marker at all, so the heuristic passed every one
+ * of them through.
+ *
+ * Visibility-only on the same terms as the sibling: preference resolution reads
+ * the UNfiltered catalog, so a persisted preference on a superseded model is
+ * still honored — the row leaves the picker, never the session. Same empty-list
+ * fallback, for the same reason.
+ */
+function hideSupersededModels(models: ModelInfo[], logger?: Logger): ModelInfo[] {
+  const visible = filterSupersededModels(models);
+  if (visible.length === 0 && models.length > 0) {
+    logger?.error(
+      "Recency filter would hide every available model; showing the unfiltered list instead.",
     );
     return models;
   }
