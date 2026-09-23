@@ -2,14 +2,36 @@
  * The versioned `_meta` extension that carries context-compaction facts on the
  * synthetic ACP tool call (story 010, R2.1/D3).
  *
- * Why an extension rather than the protocol's own variant: ACP 1.4 does define
- * a `compaction_update`, but the Rust crate the packaged Zed links
- * (`agent-client-protocol 2.0.0`) carries no `compaction` symbol at all, so
- * that variant cannot be deserialised no matter what this adapter sends. The
- * reachable pattern is the one downstream patch `0011` already proves: emit a
- * `_meta` key no ACP variant claims, and let a downstream patch read it. The
- * tool call renders with `ToolKind::Think`'s icon even with no patch present,
- * so R2.1 ships and works on its own.
+ * Why an extension rather than the protocol's own variant: it is a CHOICE, and
+ * this paragraph used to record it as a necessity. The premise it rested on --
+ * that the linked Rust crate had no compaction symbol, so the native
+ * notification could not be received here whatever was sent -- was FALSE.
+ *
+ * Deliberately paraphrased rather than quoted. This claim had FIVE copies across
+ * the chain, and the way anyone finds the next one is by grepping for its exact
+ * words; a line here reproducing them would answer that grep with a hit and read,
+ * out of context, as the claim still being made.
+ *
+ * Five, and the count itself was wrong twice. The plan said three, the run
+ * reported four and called the fourth "last", and an audit found the fifth in the
+ * published mirror -- whose only difference from this file WAS this paragraph. A
+ * closed list is how the fifth survived; the check that works is the grep, over
+ * every repository the chain has, not a list anyone maintains.
+ *
+ * Measurably false: the packaged Zed links
+ * `agent-client-protocol` 2.2.0 with schema 1.9.1, `acp_thread.rs` matches
+ * `acp::SessionUpdate::CompactionUpdate` outright, and Zed constructs
+ * `acp::CompactionUpdate::new(...)` itself. Not just present in the crate --
+ * already handled by the client. Measured on the packaged commit, and true of
+ * at least the three before it.
+ *
+ * What IS true is narrower and sufficient: the `_meta` route is the one
+ * downstream patch `0011` already proves; it works against a Zed carrying no
+ * patch at all, because the tool call renders with `ToolKind::Think`'s icon
+ * either way; and it is the half of the pair that can ship without waiting for
+ * the other. So R2.1 ships and works on its own -- which was always the real
+ * argument. Moving to the native variant is an OPEN DECISION about which
+ * channel to prefer, not a blocked one, and it is tracked as such.
  *
  * Why the version field is not optional (D3): it is what makes the two halves
  * independently releasable in BOTH directions — a newer adapter against an
