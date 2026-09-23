@@ -45,7 +45,7 @@ const MIRROR_ROOT = join(HERE, "..", "..");
 const FORK_ROOT = join(MIRROR_ROOT, "..", "fork");
 
 const SDK = "@anthropic-ai/claude-agent-sdk";
-const PINNED = "0.3.269";
+const PINNED = "0.3.273";
 
 function readJson(path: string): Record<string, any> {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -61,7 +61,7 @@ describe("agent SDK pin", () => {
   });
 
   it("carries no range operator, so a later publish cannot be taken silently", () => {
-    // `^0.3.269` and `0.3.269` install the same thing TODAY and diverge at the
+    // `^0.3.273` and `0.3.273` install the same thing TODAY and diverge at the
     // next publish. Equality alone would accept the range on the day it is
     // introduced, which is exactly when it is still invisible.
     const spec = dependenciesOf(MIRROR_ROOT)[SDK] ?? "";
