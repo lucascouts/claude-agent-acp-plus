@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.0...v0.20.1) (2026-09-23)
+
+
+### Miscellaneous Chores
+
+* **deps:** bump the minor group across 1 directory with 5 updates ([#112](https://github.com/lucascouts/claude-agent-acp-plus/issues/112)) ([06d834d](https://github.com/lucascouts/claude-agent-acp-plus/commit/06d834d5c069c1043d3c59a13f3fb73be13568a9))
+
 ## [0.20.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.19.0...v0.20.0) (2026-09-23)
 
 
