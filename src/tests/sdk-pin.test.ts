@@ -18,8 +18,27 @@ import { fileURLToPath } from "node:url";
  *   - CLI >=2.1.274 answers queued background completions with placeholder
  *     results (`num_turns: 0`).
  *
- * 0.3.269 bundles CLI 2.1.269, below both. Crossing either is a port, not a
- * bump: it can hang a turn that spawned background subagents.
+ * Crossing either is a port, not a bump: it can hang a turn that spawned
+ * background subagents. BOTH have since been crossed, each with its own
+ * evidence, and this paragraph is kept because the cliffs are still the reason
+ * a bump here is not routine:
+ *
+ *   - **2.1.270 — ported.** The fork now sweeps the counter at the `running`
+ *     transition (`[turn/idle-debt] swept=... at=running-transition` in
+ *     acp-agent.ts), which is precisely the upstream d3205ab behaviour the
+ *     paragraph above says this adapter does not carry. It does now.
+ *   - **2.1.274 — crossed 2026-09-23, measured not to hang.** Raising the pin
+ *     0.3.273 -> 0.3.280 for CLI 2.1.280 (Claude Opus 5.5) went past it. Two
+ *     independent live measurements on the bumped binary, both green:
+ *     a turn driven through the built adapter over ACP stdio returned
+ *     `stopReason: end_turn` in 9.9 s after spawning a `Task`; and the same
+ *     prompt through `query()` returned `terminal_reason: "completed"`,
+ *     `num_turns: 1`, with `subagent_stats.started_in_background: 2` and
+ *     `completed: 2`. The placeholder-result shape this cliff predicts did not
+ *     appear.
+ *
+ * Neither measurement is a regression test, and that is the point of the
+ * paragraph below: re-measure on the next crossing rather than trusting green.
  *
  * WHY THIS TEST EXISTS, when a sibling guard already lives in the fork.
  * The fork's src/tests/deps.test.ts asserts the same contract, but the two are
@@ -37,7 +56,14 @@ import { fileURLToPath } from "node:url";
  *
  * RAISING THE PIN. Change PINNED in the same commit that ports the accounting,
  * never before it, and move the fork first: the fork leads, the mirror follows
- * (the fork's guard enforces that order from its side).
+ * (the fork's guard enforces that order from its side). What the guards actually
+ * constrain is the RESTING state -- equal pins, with the mirror never ahead -- so
+ * what matters is that both trees land on the same value in the same change.
+ *
+ * And re-run the background-subagent probe by hand, because nothing here will:
+ * the doubles in session-doubles.ts emit the pre-cliff cadence by construction,
+ * so a crossing that hangs production leaves this suite entirely green. A live
+ * turn that spawns background subagents is the only signal that means anything.
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -45,7 +71,7 @@ const MIRROR_ROOT = join(HERE, "..", "..");
 const FORK_ROOT = join(MIRROR_ROOT, "..", "fork");
 
 const SDK = "@anthropic-ai/claude-agent-sdk";
-const PINNED = "0.3.273";
+const PINNED = "0.3.280";
 
 function readJson(path: string): Record<string, any> {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -61,7 +87,7 @@ describe("agent SDK pin", () => {
   });
 
   it("carries no range operator, so a later publish cannot be taken silently", () => {
-    // `^0.3.273` and `0.3.273` install the same thing TODAY and diverge at the
+    // `^0.3.280` and `0.3.280` install the same thing TODAY and diverge at the
     // next publish. Equality alone would accept the range on the day it is
     // introduced, which is exactly when it is still invisible.
     const spec = dependenciesOf(MIRROR_ROOT)[SDK] ?? "";

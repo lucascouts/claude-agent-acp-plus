@@ -47,20 +47,41 @@ updates:
       # The pin crossed that cliff on 2026-09-22 and sits at 0.3.273, whose
       # bundled CLI is 2.1.273.
       #
-      # STILL STANDING. CLI >=2.1.274 answers queued background completions
-      # with placeholder results, and nothing here ports that yet. 0.3.274 is
-      # the first release on the far side, so the next bump is the one that
-      # needs the port -- crossing it is an epic, not a merge, and bumping the
-      # pin alone can hang a turn that has background subagents.
+      # CROSSED 2026-09-23, MEASURED, NOT PORTED. CLI >=2.1.274 answers queued
+      # background completions with placeholder results. The pin moved
+      # 0.3.273 -> 0.3.280 (CLI 2.1.280) to make Claude Opus 5.5 offerable, so
+      # this cliff is now behind the pin. No port was written; what replaced it
+      # is a live measurement of the exact shape the cliff describes, driven
+      # through the built adapter over ACP stdio:
       #
-      # WHY THE IGNORE STAYS ANYWAY, with one reason gone. The ignore stops the
-      # proposal and the guard stops the merge, and only the second survives a
-      # bump made by hand -- so they are not redundant. The unit suite cannot
-      # catch a crossing either: the idle cadence comes from the doubles in
+      #   turn 1  spawns a background subagent running `sleep 45` and returns
+      #           end_turn in 14.7 s -- so its completion is genuinely QUEUED,
+      #           not delivered inside the turn
+      #   turn 2  end_turn in 1.6 s, while the subagent is still sleeping
+      #   (wait 75 s, so the completion has certainly been delivered)
+      #   turn 3  end_turn in 1.5 s   turn 4  end_turn in 1.9 s
+      #
+      # No turn hung, before or after delivery. A first attempt at this looked
+      # green and proved nothing -- its subagents finished inside the turn, so
+      # no completion was ever queued. The wait is what makes it evidence.
+      #
+      # WHAT THIS IS NOT. It is one prompt shape, run twice, on one account. It
+      # is not a regression test and nothing re-runs it. If a turn hangs around
+      # background subagents, SUSPECT THIS FIRST and re-run the probe before
+      # looking anywhere else. The honest state is "measured safe", not "ported".
+      #
+      # WHY THE IGNORE STAYS, with both reasons now behind the pin. It stops the
+      # PROPOSAL; the guard stops the MERGE; and only the guard survives a bump
+      # made by hand -- so they are not redundant. The unit suite cannot catch a
+      # crossing either: the idle cadence comes from the doubles in
       # src/tests/session-doubles.ts, so a bumped pin stays green. Dependabot
       # PR #106 was merged on 2026-09-22 for exactly that reason and had to be
-      # reverted. The pin moves in a fork-sync story, with the fork leading --
-      # src/tests/deps.test.ts in the fork enforces that order from its side.
+      # reverted (cddfd82). The 2026-09-23 bump was made by hand for a reason an
+      # auto-PR cannot have -- a named model release -- and carried the live
+      # measurement above. That is the bar: an SDK bump here is a deliberate
+      # change with a probe attached, never a merge. The pin moves in a
+      # fork-sync story, with the fork leading -- src/tests/deps.test.ts in the
+      # fork enforces that order from its side.
       - dependency-name: "@anthropic-ai/claude-agent-sdk"
       - dependency-name: "@anthropic-ai/claude-agent-sdk-*"
     # Release cooldown: don't adopt a version published <7 days ago
