@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.20.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.19.0...v0.20.0) (2026-09-23)
+
+
+### Features
+
+* **models:** offer only the newest model of each family in the picker ([3296fd2](https://github.com/lucascouts/claude-agent-acp-plus/commit/3296fd2cb054854770024ba5c01dfb9ac2c955da))
+
+
+### Miscellaneous Chores
+
+* **deps:** raise the agent SDK pin to 0.3.280, for CLI 2.1.280 ([2bbd4be](https://github.com/lucascouts/claude-agent-acp-plus/commit/2bbd4becc155eb067e92a672ea3c61b58fcca276))
+* **deps:** take the fork's 0.3.273, and say what still holds the pin ([8410929](https://github.com/lucascouts/claude-agent-acp-plus/commit/8410929091edeed55599265be0e3ee8a47f28f00))
+
+
+### Documentation
+
+* **compaction:** the fifth copy, in the repository that publishes ([50df2c7](https://github.com/lucascouts/claude-agent-acp-plus/commit/50df2c704eb0435e34e600c6ec69a96846fdb071))
+
 ## [0.19.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.18.0...v0.19.0) (2026-09-22)
 
 
