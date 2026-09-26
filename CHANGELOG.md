@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.20.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.1...v0.20.2) (2026-09-26)
+
+
+### Bug Fixes
+
+* **auth:** read "Please run /login" as a sign-out only on an error result ([f3f9c6d](https://github.com/lucascouts/claude-agent-acp-plus/commit/f3f9c6d1cd0e553e7a6d4b8c82fe4d207c89d89b))
+* **compaction:** close the three interruption paths the audit found ([d687a14](https://github.com/lucascouts/claude-agent-acp-plus/commit/d687a146dec50063c1af8a5798d9a5ac13444aed))
+* **plan:** continue a clear-context plan approved in a background followup ([9eb23bc](https://github.com/lucascouts/claude-agent-acp-plus/commit/9eb23bcd34b90d2155d66d78bcdd9f92a8e37199))
+* **plan:** offer bypass alongside auto when approving a plan ([41982be](https://github.com/lucascouts/claude-agent-acp-plus/commit/41982bef49400ebeb63ca81584f9a57738a5152a))
+* **plan:** publish the effective mode after a plan is approved ([7889619](https://github.com/lucascouts/claude-agent-acp-plus/commit/788961976a59fcf06a6f12f72c12e702d9217668))
+* **replay:** replay marker-only slash skill prompts ([c9cfe04](https://github.com/lucascouts/claude-agent-acp-plus/commit/c9cfe04b7927d1a3972200229633c311416c7c25))
+* **startup:** keep the agent starting when the managed-policy tier cannot be read ([ec5fedd](https://github.com/lucascouts/claude-agent-acp-plus/commit/ec5fedd886be4ca91cc131c9c66aee9116384c74))
+* **tools:** render Write calls that use the path/file_text aliases ([2727eed](https://github.com/lucascouts/claude-agent-acp-plus/commit/2727eed3a236fc13550f2123cb44369cbc6567da))
+* **usage:** keep the context meter when a synthetic frame follows a real one ([bc67f70](https://github.com/lucascouts/claude-agent-acp-plus/commit/bc67f70d210d64c717e2166889b2860f370f3705))
+
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump prettier from 3.9.7 to 3.9.8 in the minor group ([#114](https://github.com/lucascouts/claude-agent-acp-plus/issues/114)) ([924dfcc](https://github.com/lucascouts/claude-agent-acp-plus/commit/924dfccc1437a0a4b973fa862eca093aeea978a5))
+
 ## [0.20.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.0...v0.20.1) (2026-09-23)
 
 
