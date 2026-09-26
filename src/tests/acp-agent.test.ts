@@ -2095,9 +2095,9 @@ describe("usage-limit failure replay", () => {
     session.input = input;
 
     await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "/usage" }] });
-    await vi.waitFor(() => {
-      expect(updates.some((update) => update.update.sessionUpdate === "usage_update")).toBe(true);
-    });
+    // The synthetic local-command frame carries zero usage; it must not be
+    // reported as the session's context usage.
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
 
     const failures = updates
       .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
@@ -5003,7 +5003,15 @@ describe("stop reason propagation", () => {
       { log: () => {}, error: () => {} },
     );
     (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const priorAssistant = createAssistantError(undefined);
+    priorAssistant.message.usage = {
+      input_tokens: 170000,
+      output_tokens: 910,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    } as any;
     injectSession(agent, [
+      priorAssistant,
       createUsageLimitAssistantError(),
       createResultMessage({
         subtype: "success",
@@ -5028,6 +5036,42 @@ describe("stop reason propagation", () => {
       }),
     );
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
+    const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
+    expect(usageUpdates.at(-1)?.update).toEqual(
+      expect.objectContaining({ used: 170910, size: 200000 }),
+    );
+  });
+
+  it("keeps the prior turn's context usage when a fresh turn is refused for quota", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createUsageLimitAssistantError(),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private provider detail",
+      }),
+    ]);
+    agent.sessions["test-session"].contextUsedTokens = 170910;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: "limit" }),
+    );
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
+    expect(agent.sessions["test-session"].contextUsedTokens).toBe(170910);
   });
 
   it("preserves live usage-limit prose for clients without typed failures", async () => {
