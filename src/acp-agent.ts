@@ -1055,13 +1055,29 @@ function disarmForceCancel(session: Session): void {
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
  *  recreating the underlying Query process.  MCP servers are sorted by name
- *  so that ordering differences don't trigger unnecessary recreations. */
-function computeSessionFingerprint(params: {
+ *  so that ordering differences don't trigger unnecessary recreations.
+ *
+ *  Additional directories are part of it (the additionalDirectories half of
+ *  upstream #1097): the SDK reads them only when the process starts, so a warm
+ *  resume that changed them would otherwise keep the old workspace roots. They
+ *  are resolved the way createSession resolves them -- the ACP field, else
+ *  `_meta.additionalRoots` -- then de-duplicated and sorted, so an absent list
+ *  and an empty one, or the same list reordered, reuse the running query. */
+export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  additionalDirectories?: NewSessionRequest["additionalDirectories"];
+  _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+  const additionalDirectories = [
+    ...new Set(
+      params.additionalDirectories ??
+        (params._meta as NewSessionMeta | undefined)?.additionalRoots ??
+        [],
+    ),
+  ].sort();
+  return JSON.stringify({ cwd: params.cwd, mcpServers: servers, additionalDirectories });
 }
 
 export type SDKMessageFilter = {
