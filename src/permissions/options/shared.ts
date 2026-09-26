@@ -27,6 +27,8 @@ export interface PermissionOptionContext {
    *  approvable by a single stray keystroke. */
   defaultToNo?: boolean;
   availableModes?: readonly string[];
+  /** The mode the session left when it entered plan mode. */
+  prePlanMode?: string;
   contextUsedPercent?: number;
 }
 
