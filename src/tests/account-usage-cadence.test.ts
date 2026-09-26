@@ -463,6 +463,13 @@ describe("the structured usage report is requested at both borders, and while id
     installSession(usage);
     await runTurn();
     await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+    // Same race as the case above: this process's fire-and-forget sample must be on
+    // disk before the aged one is written, or it can land after it and leave a
+    // FRESH sample behind -- then no fetch happens. It failed exactly that way in
+    // the mirror's CI on 2026-09-26, after the case above had been fixed alone.
+    await vi.waitFor(async () =>
+      expect(await fsp.readFile(quotaCachePath(), "utf8")).toContain('"utilization":42'),
+    );
 
     // A sample from two minutes ago: past the freshness window whatever the
     // interval, so the polled path must pay for a new one. Somebody has to, or
