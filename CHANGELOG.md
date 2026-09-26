@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.20.3](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.2...v0.20.3) (2026-09-26)
+
+
+### Bug Fixes
+
+* **permissions:** honor permissions.disableBypassPermissionsMode ([bfc8b7a](https://github.com/lucascouts/claude-agent-acp-plus/commit/bfc8b7a92019a703a4a74c9ea057f24500387890))
+* **session:** recreate a resumed session whose additional directories changed ([dbbda9d](https://github.com/lucascouts/claude-agent-acp-plus/commit/dbbda9dd476887391ea028efa984cb9b1daae67e))
+
 ## [0.20.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.1...v0.20.2) (2026-09-26)
 
 
