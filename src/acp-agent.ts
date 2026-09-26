@@ -144,7 +144,7 @@ import {
   UltracodeOptionState,
 } from "./ultracode.js";
 import { handleRewindCommand, parseRewindInvocation, RewindDeps } from "./rewind-command.js";
-import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
+import { resolvePermissionMode, sessionAllowsBypass } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
@@ -7468,11 +7468,19 @@ export class ClaudeAcpAgent {
       }
     }
 
+    // Decided once per session (upstream #1165): it gates the SDK flag, the
+    // spawn-time mode -- the SDK rejects bypassPermissions without the flag --
+    // and the mode catalog, so all three agree with what the CLI will accept.
+    const allowBypass = sessionAllowsBypass(settingsManager.getSettings().permissions);
     const permissionMode = resolvePermissionMode(
       settingsManager.getSettings().permissions?.defaultMode,
       this.logger,
+      allowBypass,
     );
-    const initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
+    const initialPermissionMode =
+      creationOpts.permissionMode === "bypassPermissions" && !allowBypass
+        ? "default"
+        : (creationOpts.permissionMode ?? permissionMode);
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
@@ -7645,7 +7653,7 @@ export class ClaudeAcpAgent {
       },
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
-      allowDangerouslySkipPermissions: ALLOW_BYPASS,
+      allowDangerouslySkipPermissions: allowBypass,
       permissionMode: initialPermissionMode,
       canUseTool: this.canUseTool(sessionId),
       // Forward MCP elicitation requests onto ACP elicitation. Only attached
@@ -7884,6 +7892,7 @@ export class ClaudeAcpAgent {
       requestedMode: initialPermissionMode,
       currentModelInfo,
       currentModelId: models.currentModelId,
+      allowBypass,
     });
 
     const agents = await discoverCustomAgents(q);

@@ -51,6 +51,9 @@ type InitializeSessionModeParams = {
   requestedMode: PermissionMode;
   currentModelInfo?: ModelInfo;
   currentModelId: string;
+  /** Per-session bypass permission (see `sessionAllowsBypass`). Defaults to the
+   *  process-wide root check when a caller has no settings to consult. */
+  allowBypass?: boolean;
 };
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
@@ -62,11 +65,12 @@ export class SessionModeManager<S extends SessionMode> {
     requestedMode,
     currentModelInfo,
     currentModelId,
+    allowBypass = ALLOW_BYPASS,
   }: InitializeSessionModeParams): Promise<{
     modes: SessionModeState;
     autoModeFallbackWarningPending: boolean;
   }> {
-    const availableModes = this.buildAvailableModes();
+    const availableModes = this.buildAvailableModes(allowBypass);
     let effectiveMode = requestedMode;
     let autoModeFallbackWarningPending = false;
 
@@ -289,7 +293,7 @@ export class SessionModeManager<S extends SessionMode> {
     }
   }
 
-  private buildAvailableModes(): SessionModeState["availableModes"] {
+  private buildAvailableModes(allowBypass: boolean): SessionModeState["availableModes"] {
     const modes: SessionModeState["availableModes"] = [
       {
         id: "default",
@@ -331,7 +335,7 @@ export class SessionModeManager<S extends SessionMode> {
         description: "Don't prompt for permissions, deny if not pre-approved",
       },
     ];
-    if (ALLOW_BYPASS) {
+    if (allowBypass) {
       modes.push({
         id: "bypassPermissions",
         name: "Bypass permissions",
