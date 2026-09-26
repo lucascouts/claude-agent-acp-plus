@@ -4359,7 +4359,9 @@ export class ClaudeAcpAgent {
                   const goalCommandFailed =
                     message.is_error ||
                     message.stop_reason === "refusal" ||
-                    ("result" in message && message.result.includes("Please run /login"));
+                    ("result" in message &&
+                      message.is_error &&
+                      message.result.includes("Please run /login"));
                   if (goalCommandFailed) {
                     await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
                   }
@@ -4637,7 +4639,7 @@ export class ClaudeAcpAgent {
 
               switch (message.subtype) {
                 case "success": {
-                  if (message.result.includes("Please run /login")) {
+                  if (message.is_error && message.result.includes("Please run /login")) {
                     await failActiveWithSessionFailure(
                       "auth_required",
                       RequestError.authRequired(),

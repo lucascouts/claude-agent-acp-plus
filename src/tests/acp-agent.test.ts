@@ -4797,6 +4797,42 @@ describe("stop reason propagation", () => {
     );
   });
 
+  // Upstream #1103: only an error-shaped result is a sign-out; a normal answer
+  // that quotes the CLI's login text must neither fail the turn nor publish one.
+  it("does not treat a successful answer mentioning /login as auth_required", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const answer = "A normal answer can quote: Please run /login.";
+    injectSession(agent, [
+      createAssistantError(undefined, answer),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: answer,
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const published = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(sessionFailureFromResponse(response)).toBeUndefined();
+    expect(published).toEqual([]);
+  });
+
   it("clears a connection retry warning internally after the turn succeeds", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
