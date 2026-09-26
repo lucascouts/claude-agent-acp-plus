@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -50,6 +50,14 @@ describe("ClaudeAcpAgent settings", () => {
     });
     return { getCapturedOptions: () => capturedOptions, setModelSpy };
   }
+
+  // The first test to import acp-agent.js pays its cold load -- the module and the
+  // mocked SDK behind it -- which under a loaded machine alone exceeded the 5 s test
+  // timeout (measured 5 274 ms on 2026-09-25, 23/23 green when re-run alone). Load it
+  // once here, on its own budget, so every test measures only its own behaviour.
+  beforeAll(async () => {
+    await import("../acp-agent.js");
+  }, 30_000);
 
   beforeEach(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "acp-agent-settings-"));
