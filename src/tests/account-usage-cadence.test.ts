@@ -415,6 +415,13 @@ describe("the structured usage report is requested at both borders, and while id
     installSession(usage);
     await runTurn();
     await vi.waitFor(() => expect(usage).toHaveBeenCalledTimes(1));
+    // This process shares its own sample fire-and-forget. Wait for that write to
+    // land first: under load it arrived AFTER the one below and overwrote it, so
+    // the poll read this process's 42% back instead of the other's 99% -- 2 of 4
+    // full runs failed that way on 2026-09-26, and every run alone passed.
+    await vi.waitFor(async () =>
+      expect(await fsp.readFile(quotaCachePath(), "utf8")).toContain('"utilization":42'),
+    );
 
     // A DIFFERENT adapter process publishes a sample. That is the whole point:
     // ten Zed windows asking one account the same question should cost one
