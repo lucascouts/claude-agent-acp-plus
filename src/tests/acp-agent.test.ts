@@ -34,6 +34,7 @@ import {
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
+  computeSessionFingerprint,
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
@@ -6848,10 +6849,9 @@ describe("getOrCreateSession param change detection", () => {
       cancelled: false,
       titles: new SessionTitles(agent, sessionId),
       cwd,
-      sessionFingerprint: JSON.stringify({
-        cwd,
-        mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
-      }),
+      // The agent's own function, not a copy of its output format: a hand-built
+      // literal silently stops matching the moment the fingerprint gains a field.
+      sessionFingerprint: computeSessionFingerprint({ cwd, mcpServers }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
