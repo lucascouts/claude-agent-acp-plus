@@ -323,6 +323,12 @@ type SteerMeta = {
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
  *  chooses (see {@link STEER_PRIORITY_NOW} / {@link STEER_PRIORITY_LATER}). */
+/** `session_info_update._meta` key carrying the live, non-ambient background
+ *  tasks (`{ count, tasks: [{ id, type, description }] }`). The level the SDK
+ *  reports in `background_tasks_changed`, so a client can tell an idle thread
+ *  from one whose turn ended while a shell or subagent keeps running. */
+export const BACKGROUND_TASKS_META_KEY = "_claude/backgroundTasks";
+
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
@@ -585,6 +591,11 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
+  /** Sorted, newline-joined ids of the non-ambient background tasks last
+   *  published under {@link BACKGROUND_TASKS_META_KEY}; undefined = none yet,
+   *  which compares equal to an empty set so a session that never runs one
+   *  sends nothing. */
+  lastPublishedBackgroundTasks?: string;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -2740,6 +2751,38 @@ export class ClaudeAcpAgent {
      *  below only dereferences `sendUpdate` when an update is actually sent,
      *  which is always after both bindings exist. */
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
+    /** Publish the live background-task set as
+     *  `session_info_update._meta["_claude/backgroundTasks"]`, only when its
+     *  membership changed: `background_tasks_changed` also fires for ambient
+     *  tasks this view filters out, and an unchanged set is not news. */
+    const publishBackgroundTasks = async (
+      tasks: { task_id: string; task_type: string; description: string }[],
+    ) => {
+      const key = tasks
+        .map((task) => task.task_id)
+        .sort()
+        .join("\n");
+      if (key === (session.lastPublishedBackgroundTasks ?? "")) {
+        return;
+      }
+      session.lastPublishedBackgroundTasks = key;
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: {
+            [BACKGROUND_TASKS_META_KEY]: {
+              count: tasks.length,
+              tasks: tasks.map((task) => ({
+                id: task.task_id,
+                type: task.task_type,
+                description: task.description,
+              })),
+            },
+          },
+        },
+      });
+    };
     const sendUpdate = async (notification: SessionNotification) => {
       const { update } = notification;
       if (
@@ -4324,6 +4367,12 @@ export class ClaudeAcpAgent {
                     }
                   }
                 }
+                // The same level, forwarded: once the turn has settled the
+                // client reads the thread as idle, and a background shell or
+                // subagent still running is invisible to it. Ambient tasks
+                // (watchers, skip_transcript work) are excluded because the
+                // SDK marks them as "not activity" for exactly this use.
+                await publishBackgroundTasks(message.tasks.filter((task) => !task.ambient));
                 break;
               default:
                 unreachable(message, this.logger);

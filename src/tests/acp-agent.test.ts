@@ -33,6 +33,7 @@ import {
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
+  BACKGROUND_TASKS_META_KEY,
   claudeCliPath,
   computeSessionFingerprint,
   streamEventToAcpNotifications,
@@ -12246,6 +12247,68 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     expect(record?.endedPerLevel).toBe("ended");
     releaseIdle();
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("publishes the non-ambient background set, past the turn, only on change", async () => {
+    // The client reads a settled turn as an idle thread; the level is how it
+    // learns a shell launched in that turn is still running, and when it ends.
+    const published: unknown[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          const meta = notification.update._meta as Record<string, unknown> | undefined;
+          if (
+            notification.update.sessionUpdate === "session_info_update" &&
+            meta?.[BACKGROUND_TASKS_META_KEY]
+          ) {
+            published.push(meta[BACKGROUND_TASKS_META_KEY]);
+          }
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const level = (tasks: { task_id: string; ambient?: boolean }[]) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: tasks.map((task) => ({ task_type: "local_bash", description: "sleep", ...task })),
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    let releaseAfterTurn!: () => void;
+    const afterTurn = new Promise<void>((resolve) => (releaseAfterTurn = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield level([{ task_id: "bash-1" }]);
+        yield resultMessage();
+        yield idle();
+        await afterTurn;
+        // An ambient watcher joining changes nothing the client shows.
+        yield level([{ task_id: "bash-1" }, { task_id: "watch-1", ambient: true }]);
+        yield level([{ task_id: "watch-1", ambient: true }]);
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run it in the background" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    expect(published).toEqual([
+      { count: 1, tasks: [{ id: "bash-1", type: "local_bash", description: "sleep" }] },
+    ]);
+
+    releaseAfterTurn();
+    await agent.sessions["test-session"]?.consumer;
+    expect(published).toEqual([
+      { count: 1, tasks: [{ id: "bash-1", type: "local_bash", description: "sleep" }] },
+      { count: 0, tasks: [] },
+    ]);
   });
 
   it("keeps holding through a peer-origin autonomous result", async () => {
