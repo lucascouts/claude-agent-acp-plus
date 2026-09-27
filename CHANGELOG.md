@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.3...v0.21.0) (2026-09-27)
+
+
+### Features
+
+* **session:** publish the live background-task set to the client ([789cdf2](https://github.com/lucascouts/claude-agent-acp-plus/commit/789cdf216fdfdfc214c9c19c276a77621d4379a3))
+
 ## [0.20.3](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.2...v0.20.3) (2026-09-26)
 
 
