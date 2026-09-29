@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.1...v0.22.2) (2026-09-29)
+
+
+### Bug Fixes
+
+* **usage:** render /usage from the CLI's synthetic frame and log every fallback ([#123](https://github.com/lucascouts/claude-agent-acp-plus/issues/123)) ([ccc5101](https://github.com/lucascouts/claude-agent-acp-plus/commit/ccc5101bacc1e24875f78506046caf2d9ec7f669))
+
 ## [0.22.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.0...v0.22.1) (2026-09-29)
 
 
