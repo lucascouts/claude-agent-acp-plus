@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.22.1](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.0...v0.22.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **elicitation:** keep multi-select answers when a custom answer is typed ([a12a8c4](https://github.com/lucascouts/claude-agent-acp-plus/commit/a12a8c425ecf31dd612b138ebedd966f6bd9798b))
+* **elicitation:** keep the picked option when custom text is also supplied ([05245ad](https://github.com/lucascouts/claude-agent-acp-plus/commit/05245ad461b401146ab00d7c14835ffcb45e84bf))
+* **replay:** a reopened compacted thread replays from its first prompt ([ead5647](https://github.com/lucascouts/claude-agent-acp-plus/commit/ead5647106e45dea9805cfaf4f7cb3f2da36d1fd))
+* **thinking:** a fresh thread's first turn no longer carries the recreate note ([26628e9](https://github.com/lucascouts/claude-agent-acp-plus/commit/26628e96e45eb06034d382c71f2f8da3d368c511))
+
 ## [0.22.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.21.0...v0.22.0) (2026-09-29)
 
 
