@@ -228,7 +228,11 @@ import {
   envForAccount,
   readDeclaredAccounts,
 } from "./accounts.js";
-import { isUsageCommandText, structuredUsageMarkdown } from "./usage-markdown.js";
+import {
+  isUsageCommandText,
+  structuredUsageMarkdown,
+  syntheticLocalCommand,
+} from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -428,6 +432,12 @@ type Turn = {
   /** Set once the render has been published, so the SAME output arriving again
    *  through a second message shape is not rendered twice. */
   usageMarkdownDelivered?: boolean;
+  /** Why the render was not produced (timed out, incompatible, failed), held
+   *  until the original text is actually published: a turn cancelled first
+   *  fell back to nothing and must log nothing (story 011, R2.3). */
+  usageFallbackReason?: string;
+  /** Set once this turn has logged its one fallback line (story 011, R2.2). */
+  usageFallbackLogged?: boolean;
   /** The original text the published render replaced — how a duplicate mirror
    *  of that frame is told from a later, genuinely different one. */
   usageOriginalOutput?: string;
@@ -977,6 +987,11 @@ export type Session = {
    *  turn already active or queued when the autonomous result lands) does
    *  the replayed turn stay silent rather than risk a duplicate. */
   emittedAssistantText: boolean;
+  /** The last turn whose prompt was exactly `/usage`. CLI 2.1.280 can send the
+   *  command's synthetic frame AFTER the result that settled the turn, when no
+   *  active or queued turn is left to own it; this is how that trailing copy
+   *  is recognised as output already rendered (story 011, R1.3). */
+  lastUsageTurn?: Turn;
   /** The most recent `session_state_changed` state the consumer processed.
    *  Read by cancel() to decide whether the interrupt will produce a
    *  trailing idle worth pre-counting: interrupting a RUNNING cycle yields
@@ -2948,7 +2963,11 @@ export class ClaudeAcpAgent {
       turn.usageMarkdown ??= structuredUsageMarkdown(
         session.query,
         turn.usageMarkdownAbort.signal,
-        this.logger,
+        {
+          error: (message) => {
+            turn.usageFallbackReason ??= message;
+          },
+        },
       );
       return turn.usageMarkdown;
     };
@@ -3179,7 +3198,24 @@ export class ClaudeAcpAgent {
     ): Promise<string | null | undefined> => {
       const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
       if (!turn) {
+        // A copy of output the last `/usage` turn already rendered, arriving
+        // after the result settled it: publish nothing.
+        const last = session.lastUsageTurn;
+        if (last?.usageMarkdownDelivered && last.usageOriginalOutput === originalOutput) {
+          return null;
+        }
+        if (!last?.usageFallbackLogged) {
+          this.logger.error(
+            "Structured /usage not applied: turn not resolved for the command's output; preserving Claude Code output",
+          );
+          if (last) {
+            last.usageFallbackLogged = true;
+          }
+        }
         return undefined;
+      }
+      if (turn.isUsageCommand) {
+        session.lastUsageTurn = turn;
       }
       const pending = ensureUsageMarkdown(turn);
       if (!pending) {
@@ -3193,6 +3229,12 @@ export class ClaudeAcpAgent {
         return null;
       }
       if (markdown === null) {
+        if (!turn.usageFallbackLogged) {
+          this.logger.error(
+            turn.usageFallbackReason ?? "Structured /usage failed; preserving Claude Code output",
+          );
+          turn.usageFallbackLogged = true;
+        }
         return undefined;
       }
       if (turn.usageMarkdownDelivered) {
@@ -4515,6 +4557,22 @@ export class ClaudeAcpAgent {
               // through the early break below, which the gated `finally`
               // leaves alone).
               const deliveredAssistantText = session.emittedAssistantText;
+              // Story 011, R2.1: a `/usage` turn whose output already reached
+              // the client through a shape no interception point claimed —
+              // neither rendered nor logged by any other way out.
+              const usageTurn = session.activeTurn;
+              if (
+                usageTurn?.isUsageCommand &&
+                deliveredAssistantText &&
+                !usageTurn.usageMarkdownDelivered &&
+                !usageTurn.usageFallbackLogged &&
+                !session.cancelled
+              ) {
+                this.logger.error(
+                  "Structured /usage not applied: the command's output was not intercepted; preserving Claude Code output",
+                );
+                usageTurn.usageFallbackLogged = true;
+              }
               // The deleted "Compacting…" banners counted as delivered text
               // simply by going through sendUpdate; tool calls don't, so a turn
               // that ONLY compacted (e.g. `/compact`, promoted at its own
@@ -5391,6 +5449,45 @@ export class ClaudeAcpAgent {
               supportsAirSessionFailures(this.clientCapabilities)
             ) {
               break;
+            }
+
+            // Story 011: CLI >=2.1.280 answers `/usage` with a synthetic
+            // assistant frame marked `local_command_run.command: "usage"`.
+            // Published as ordinary text it also silenced the result branch,
+            // the last place the render was requested, so the render never
+            // ran. Claim it here: null publishes nothing, a render replaces
+            // the frame, and undefined falls through to the frame's own text.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>" &&
+              syntheticLocalCommand(message) === "usage"
+            ) {
+              const original = assistantMessageText(message.message) ?? "";
+              const usageMarkdown = await takeUsageMarkdown(original);
+              if (usageMarkdown === null) {
+                break;
+              }
+              if (usageMarkdown !== undefined) {
+                for (const notification of toAcpNotifications(
+                  usageMarkdown,
+                  "assistant",
+                  params.sessionId,
+                  session.toolUseCache,
+                  this.client,
+                  this.logger,
+                  {
+                    clientCapabilities: this.clientCapabilities,
+                    parentToolUseId: message.parent_tool_use_id,
+                    cwd: session.cwd,
+                    taskState: session.taskState,
+                    messageId: messageIdForGrouping(message),
+                  },
+                )) {
+                  await sendUpdate(notification);
+                }
+                break;
+              }
             }
 
             let content: typeof message.message.content;
