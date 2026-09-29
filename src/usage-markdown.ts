@@ -137,6 +137,27 @@ export function isUsageCommandText(text: string): boolean {
   return text.trim() === "/usage";
 }
 
+/**
+ * The local command a synthetic assistant frame answers, or undefined.
+ *
+ * CLI 2.1.280 answers `/usage` with a top-level assistant frame whose model is
+ * `<synthetic>` and whose `local_command_run` names the command — not with the
+ * `local_command_output` message or the `<local-command-stdout>` user frame the
+ * other interception points read. The SDK's message type does not declare the
+ * field, so it is narrowed from `unknown` here rather than cast.
+ */
+export function syntheticLocalCommand(message: unknown): string | undefined {
+  if (!message || typeof message !== "object" || !("local_command_run" in message)) {
+    return undefined;
+  }
+  const run = (message as { local_command_run: unknown }).local_command_run;
+  if (!run || typeof run !== "object" || !("command" in run)) {
+    return undefined;
+  }
+  const command = (run as { command: unknown }).command;
+  return typeof command === "string" ? command : undefined;
+}
+
 /** Cells in a progress bar. Fixed width, so bars line up under one another. */
 const USAGE_BAR_CELLS = 20;
 
