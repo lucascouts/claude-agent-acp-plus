@@ -213,6 +213,7 @@ import {
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import { withPrecompactHistory } from "./compacted-history.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { AccountUsageTracker } from "./account-usage.js";
 import { readFreshLimits, sharedSampleMaxAgeMs, writeLimits } from "./quota-cache.js";
@@ -6185,7 +6186,13 @@ export class ClaudeAcpAgent {
 
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    // getSessionMessages stops at the last compaction boundary; put the history
+    // before it back, so a reopened compacted thread scrolls to its first prompt.
+    const messages = await withPrecompactHistory(
+      sessionId,
+      await getSessionMessages(sessionId),
+      CLAUDE_CONFIG_DIR,
+    );
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
