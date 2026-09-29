@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.22.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.21.0...v0.22.0) (2026-09-29)
+
+
+### Features
+
+* **notices:** send live advisories as ACP session notices ([46a0457](https://github.com/lucascouts/claude-agent-acp-plus/commit/46a045758e5817e9ca67b6377a82883f9c05be03))
+
+
+### Miscellaneous Chores
+
+* **deps:** bump github/codeql-action/upload-sarif in the actions group ([#119](https://github.com/lucascouts/claude-agent-acp-plus/issues/119)) ([77da1a7](https://github.com/lucascouts/claude-agent-acp-plus/commit/77da1a7caeffc34597d6a026531b50b6ea94009b))
+* **deps:** bump the minor group across 1 directory with 14 updates ([#120](https://github.com/lucascouts/claude-agent-acp-plus/issues/120)) ([47fab64](https://github.com/lucascouts/claude-agent-acp-plus/commit/47fab64920a8cbcd4101e71fd0533f9eae22fd0f))
+
 ## [0.21.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.20.3...v0.21.0) (2026-09-27)
 
 
