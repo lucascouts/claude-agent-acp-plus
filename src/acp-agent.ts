@@ -214,6 +214,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { withPrecompactHistory } from "./compacted-history.js";
+import { findTranscript } from "./transcript-path.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { AccountUsageTracker } from "./account-usage.js";
 import { readFreshLimits, sharedSampleMaxAgeMs, writeLimits } from "./quota-cache.js";
@@ -7174,6 +7175,20 @@ export class ClaudeAcpAgent {
       delete options.thinking;
       if (thinking !== undefined) {
         options.thinking = thinking;
+      }
+      // A session that has not finished a turn yet has no transcript, and
+      // resuming it fails ("No conversation found with session ID"): that is why
+      // every fresh thread's first turn used to carry the "could not be applied"
+      // note -- Zed applies default_config_options.thinking before the first
+      // prompt, which schedules this recreate. With nothing to resume, start the
+      // replacement as a new session under the same id. Only on proof: the
+      // transcript is looked for in the config dir THIS query runs with (an
+      // account overlay moves it), and anything short of "not there" keeps
+      // resuming, which is what the code did before.
+      const configDir = session.queryOptions.env?.CLAUDE_CONFIG_DIR ?? CLAUDE_CONFIG_DIR;
+      if ((await findTranscript(configDir, sessionId)) === undefined) {
+        delete options.resume;
+        options.sessionId = sessionId;
       }
       if (session.currentAgent === DEFAULT_AGENT_ID) {
         delete options.agent;

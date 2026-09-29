@@ -1,6 +1,6 @@
-import { access, readdir, readFile } from "node:fs/promises";
-import * as path from "node:path";
+import { readFile } from "node:fs/promises";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { findTranscript } from "./transcript-path.js";
 
 /**
  * The history a compaction hid from `getSessionMessages`, put back in front of it.
@@ -145,26 +145,4 @@ export function precompactMessages(
 function startsWithCompactSummary(messages: SessionMessage[]): boolean {
   const first = messages[0] as (SessionMessage & { isCompactSummary?: boolean }) | undefined;
   return first?.isCompactSummary === true;
-}
-
-/** `<configDir>/projects/<any project>/<sessionId>.jsonl` -- where the SDK looks
- *  when `getSessionMessages` is called without a directory. */
-async function findTranscript(configDir: string, sessionId: string): Promise<string | undefined> {
-  const projects = path.join(configDir, "projects");
-  let entries: string[];
-  try {
-    entries = await readdir(projects);
-  } catch {
-    return undefined;
-  }
-  for (const entry of entries) {
-    const candidate = path.join(projects, entry, `${sessionId}.jsonl`);
-    try {
-      await access(candidate);
-      return candidate;
-    } catch {
-      // not in this project
-    }
-  }
-  return undefined;
 }
