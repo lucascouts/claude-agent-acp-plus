@@ -20,6 +20,22 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
+## Install
+
+```bash
+npm install -g @lucascouts/claude-agent-acp-plus
+```
+
+This puts `claude-agent-acp-plus` on your `PATH`. Point your ACP client at it — in Zed, an
+`agent_servers` entry of `"type": "custom"` whose `command` is `claude-agent-acp-plus`.
+
+## Test
+
+```bash
+npm ci
+npm run ci:local   # format check, lint, build, and the full test suite
+```
+
 ## Contribution Policy
 
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:
