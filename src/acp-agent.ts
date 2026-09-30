@@ -671,6 +671,9 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
+   *  init re-emit logs a plugin load failure once, not every turn. */
+  loggedPluginErrors?: string;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -3782,6 +3785,20 @@ export class ClaudeAcpAgent {
                     // Advisory reconcile only — the client keeps its current
                     // (unfiltered) list; never fail the turn over it.
                     this.logger.error(`Failed to re-advertise slash commands: ${error}`);
+                  }
+                }
+                // Plugin load failures (CLI 2.1.283+) have no ACP surface;
+                // log them so a missing plugin isn't silent.
+                if (message.plugin_errors?.length) {
+                  const pluginErrors = JSON.stringify(message.plugin_errors);
+                  if (pluginErrors !== session.loggedPluginErrors) {
+                    session.loggedPluginErrors = pluginErrors;
+                    for (const error of message.plugin_errors) {
+                      this.logger.error(
+                        `Plugin ${error.plugin} failed to load (${error.type})` +
+                          `${error.path ? ` from ${error.path}` : ""}: ${error.message}`,
+                      );
+                    }
                   }
                 }
                 break;
@@ -6957,6 +6974,42 @@ export class ClaudeAcpAgent {
     });
   }
 
+  /**
+   * Replace a heuristic context window with `getContextUsage().rawMaxTokens`
+   * without blocking the caller. The text heuristic misses natively-1M models
+   * whose picker rows carry no "1m" token (`sonnet`, and since CLI 2.1.283
+   * `opus`/`default`), which would otherwise report 200k until the first
+   * result's modelUsage. Never awaited: SDK control requests are serialized,
+   * so an awaited call would delay session/new or a model switch (before the
+   * first turn it took ~15s on older CLIs, issues #886/#880; ~0.5s on 2.1.283).
+   * Not written to `contextWindowCache` — that stays keyed to the
+   * `result.modelUsage` spellings — and a result still overwrites it.
+   * Ported from upstream #1186.
+   */
+  private refreshContextWindowInBackground(sessionId: string, session: Session): void {
+    if (session.contextWindowAuthoritative) return;
+    const { query } = session;
+    const modelId = session.models.currentModelId;
+    const stillCurrent = () =>
+      this.sessions[sessionId] === session &&
+      session.query === query &&
+      session.models.currentModelId === modelId;
+    // A synchronous throw must not fail the caller either.
+    Promise.resolve()
+      .then(() => query.getContextUsage())
+      .then(
+        (usage) => {
+          if (!stillCurrent() || session.contextWindowAuthoritative) return;
+          if (!(usage.rawMaxTokens > 0)) return;
+          session.contextWindowSize = usage.rawMaxTokens;
+          session.contextWindowAuthoritative = true;
+        },
+        (error) => {
+          if (stillCurrent()) this.logger.error("Failed to read the context window:", error);
+        },
+      );
+  }
+
   private async applyConfigOptionValue(
     sessionId: string,
     session: Session,
@@ -6971,19 +7024,16 @@ export class ClaudeAcpAgent {
       // context window for semantic aliases (e.g. `default`) whose ID alone
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
-      if (session.models.currentModelId !== value) {
-        // Seed the new model's context window WITHOUT any IPC on the switch
-        // path: cached authoritative value if we've already learned it (from a
-        // prior turn's `result.modelUsage`), else the text heuristic, else the
-        // default. We deliberately do NOT call `getContextUsage` here — before
-        // a fresh session's first prompt turn that control request is not
-        // serviced (~15s stall, issues #886/#880), and (because SDK control
-        // requests are serialized over one channel) it would drag the awaited
-        // `setModel` down with it. The authoritative window arrives on the
-        // first `result.modelUsage` for the model and is cached from there;
-        // until then a switched-to alias that has never run a turn shows the
-        // heuristic/default window, which self-corrects on its first response
-        // (matches pre-0.59.0 behavior).
+      const modelChanged = session.models.currentModelId !== value;
+      if (modelChanged) {
+        // Seed the new model's context window WITHOUT awaited IPC on the
+        // switch path: cached authoritative value if we've already learned it
+        // (from a prior turn's `result.modelUsage`), else the text heuristic,
+        // else the default. SDK control requests are serialized over one
+        // channel, so an awaited `getContextUsage` here would delay the rest
+        // of the switch (issues #886/#880); a guessed seed is instead refined
+        // in the background once the switch is done
+        // (`refreshContextWindowInBackground`).
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
@@ -7068,6 +7118,8 @@ export class ClaudeAcpAgent {
       if (modeDowngraded) {
         await this.sessionModes.publishFallbackState(sessionId, session);
       }
+      // Last, so the switch's own control requests don't queue behind it.
+      if (modelChanged) this.refreshContextWindowInBackground(sessionId, session);
     } else if (configId === AGENT_CONFIG_ID) {
       // Live agent switch — no subprocess restart needed. Apply the SDK flag
       // first so a rejected control request leaves both `currentAgent` and the
@@ -8346,6 +8398,9 @@ export class ClaudeAcpAgent {
     // land whenever the response does. `publishAccountUsage` never rejects, so
     // this cannot become an unhandled rejection.
     void this.publishAccountUsage(sessionId, this.sessions[sessionId]);
+    // A guessed window seed (text heuristic / default) is refined the same way,
+    // unawaited; a resumed session's authoritative seed makes it a no-op.
+    this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
     return {
       sessionId,
@@ -10325,6 +10380,7 @@ export function toAcpNotifications(
       case "compaction_delta":
       case "advisor_tool_result":
       case "fallback":
+      case "mcp_tool_listing":
         break;
 
       default:

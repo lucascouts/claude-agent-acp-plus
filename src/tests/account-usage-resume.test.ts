@@ -239,8 +239,11 @@ describe("a resumed session's context ring starts where the session left off (B3
 
   it("still reports 0 for a fresh session, whatever the report would have said", async () => {
     // The stub answers with a large occupancy on purpose: session/new must
-    // reach `used: 0` because it never asks, not because the answer was small.
-    const getContextUsage = vi.fn(async () => contextUsage(RESUMED_USED));
+    // reach `used: 0` because it never reads the occupancy, not because the
+    // answer was small. The report IS asked for once, unawaited, to refine a
+    // guessed window (upstream #1186); it never answers here, so the window
+    // stays the default and the occupancy is never taken from it.
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
     installQuery({ getContextUsage });
     const agent = await makeAgent();
 
@@ -250,7 +253,7 @@ describe("a resumed session's context ring starts where the session left off (B3
     // 200_000 is the default window: a fresh session has neither an occupancy
     // nor an authoritative window until its first turn confirms one.
     expect(quotaUpdates(notifications)).toEqual([{ used: 0, size: 200_000 }]);
-    expect(getContextUsage).not.toHaveBeenCalled();
+    expect(getContextUsage).toHaveBeenCalledOnce();
   });
 
   it("keeps a measured zero distinguishable from an unread report", async () => {
@@ -371,8 +374,9 @@ describe("a resumed session's context ring starts where the session left off (B3
     // the port this was MODEL.value, the freshly-computed default (models[0]).
     expect(agent.sessions[SESSION_ID]?.models.currentModelId).toBe(OTHER_MODEL.value);
     // And the request was still made: the window and occupancy still need it,
-    // and exactly once.
-    expect(getContextUsage).toHaveBeenCalledTimes(1);
+    // once on the load path -- and once more in the background, because the
+    // failed report left the window a guess (upstream #1186's refresh).
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
     // Which is why those two are still absent when it fails.
     expect(agent.sessions[SESSION_ID]?.contextUsedTokens).toBeUndefined();
   });

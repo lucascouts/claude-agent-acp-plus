@@ -71,7 +71,7 @@ const MIRROR_ROOT = join(HERE, "..", "..");
 const FORK_ROOT = join(MIRROR_ROOT, "..", "fork");
 
 const SDK = "@anthropic-ai/claude-agent-sdk";
-const PINNED = "0.3.280";
+const PINNED = "0.3.285";
 
 function readJson(path: string): Record<string, any> {
   return JSON.parse(readFileSync(path, "utf8"));
