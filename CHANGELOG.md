@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.23.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.2...v0.23.0) (2026-09-30)
+
+
+### Features
+
+* **deps:** raise the agent SDK pin to 0.3.285, for CLI 2.1.285 and Sonnet 5.5 ([d46aa89](https://github.com/lucascouts/claude-agent-acp-plus/commit/d46aa8968addc6ceb90c95007eb90da54aa4a4f5))
+
+
+### Bug Fixes
+
+* **session:** route consumer updates to the ACP session after a context clear ([f1ab0d9](https://github.com/lucascouts/claude-agent-acp-plus/commit/f1ab0d94c3d0c8ff0fee171933cf5981f473f0a0))
+
 ## [0.22.2](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.1...v0.22.2) (2026-09-29)
 
 
