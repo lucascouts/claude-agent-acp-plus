@@ -3764,7 +3764,7 @@ export class ClaudeAcpAgent {
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
                 await this.syncFastModeState(
-                  message.session_id,
+                  params.sessionId,
                   session,
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
@@ -3780,7 +3780,7 @@ export class ClaudeAcpAgent {
                 ) {
                   session.terminalSlashCommands = message.terminal_slash_commands;
                   try {
-                    await this.sendAvailableCommandsUpdate(message.session_id);
+                    await this.sendAvailableCommandsUpdate(params.sessionId);
                   } catch (error) {
                     // Advisory reconcile only — the client keeps its current
                     // (unfiltered) list; never fail the turn over it.
@@ -3815,11 +3815,11 @@ export class ClaudeAcpAgent {
                 // message (which only fires when there's content to compact) —
                 // so both frames must be able to close a lifecycle.
                 if (message.status === "compacting") {
-                  await compaction.start(message.session_id, message.uuid);
+                  await compaction.start(params.sessionId, message.uuid);
                 } else if (message.compact_result === "success") {
-                  await compaction.finish(message.session_id, message.uuid, "completed");
+                  await compaction.finish(params.sessionId, message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
-                  await compaction.finish(message.session_id, message.uuid, "failed", {
+                  await compaction.finish(params.sessionId, message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
@@ -3835,7 +3835,7 @@ export class ClaudeAcpAgent {
                 // compaction, or a replay that dropped the opening frame).
                 const compactMetadata = message.compact_metadata;
                 await compaction.finish(
-                  message.session_id,
+                  params.sessionId,
                   message.uuid,
                   "completed",
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
@@ -3863,7 +3863,7 @@ export class ClaudeAcpAgent {
                 lastAssistantTotalUsage = usedTokens ?? 0;
                 session.contextUsedTokens = usedTokens ?? 0;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
@@ -3887,7 +3887,7 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: usageMarkdown ?? message.content },
@@ -4082,7 +4082,7 @@ export class ClaudeAcpAgent {
                   ? "Recalled synthesized memory"
                   : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "tool_call",
                     toolCallId: message.uuid,
@@ -4112,7 +4112,7 @@ export class ClaudeAcpAgent {
                 // it's authoritative, and re-querying supportedCommands()
                 // would just return the same list with an extra round-trip.
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "available_commands_update",
                     availableCommands: getAvailableSlashCommands(
@@ -4163,7 +4163,7 @@ export class ClaudeAcpAgent {
                   : undefined;
                 const reason = message.decision_reason ?? message.message;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "tool_call_update",
                     toolCallId: message.tool_use_id,
@@ -4220,7 +4220,7 @@ export class ClaudeAcpAgent {
                     ? message.content
                     : `**${sentenceCase(message.level)}:** ${message.content}`;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
                     {
                       severity,
@@ -4410,7 +4410,7 @@ export class ClaudeAcpAgent {
                           ...(explanation ? { description: explanation } : {}),
                         };
                   await sendUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: noticeOrTranscriptUpdate(
                       { severity: "warning", ...notice },
                       supportsNotices,
@@ -5091,7 +5091,7 @@ export class ClaudeAcpAgent {
               (message.event.type === "content_block_delta" &&
                 message.event.delta.type === "compaction_delta");
             if (isCompactionProgress) {
-              await compaction.heartbeat(message.session_id, message.uuid);
+              await compaction.heartbeat(params.sessionId, message.uuid);
             }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
@@ -5639,7 +5639,7 @@ export class ClaudeAcpAgent {
               break;
             }
             await sendUpdate({
-              sessionId: message.session_id,
+              sessionId: params.sessionId,
               update: {
                 sessionUpdate: "tool_call_update",
                 toolCallId,
@@ -5684,7 +5684,7 @@ export class ClaudeAcpAgent {
             this.accountUsageTracker(session).recordMeasured(message.rate_limit_info);
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
-                sessionId: message.session_id,
+                sessionId: params.sessionId,
                 update: {
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
