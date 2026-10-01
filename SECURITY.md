@@ -15,7 +15,7 @@ supported with security fixes.
 **Do not open a public issue for security reports.**
 
 Use GitHub's private vulnerability reporting:
-[Report a vulnerability](https://github.com/lucascouts/claude-agent-acp-plus/security/advisories/new).
+[Report a vulnerability](https://github.com/zeo-workspace/claude-agent-acp-plus/security/advisories/new).
 
 You can expect an acknowledgement within 7 days. Please include a minimal
 reproduction, the affected version, and the impact you foresee. Coordinated
