@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.2](https://github.com/zeo-workspace/claude-agent-acp-plus/compare/v0.23.1...v0.23.2) (2026-10-03)
+
+
+### Bug Fixes
+
+* **deps:** @modelcontextprotocol/sdk 1.31.0 -&gt; 1.32.0, clearing GHSA-22jm-h49p-29qw and GHSA-6prh-2h8m-c8cw ([12d567a](https://github.com/zeo-workspace/claude-agent-acp-plus/commit/12d567aac0479305f0a7be8b1c80006806332a54))
+
 ## [0.23.1](https://github.com/zeo-workspace/claude-agent-acp-plus/compare/v0.23.0...v0.23.1) (2026-10-03)
 
 
