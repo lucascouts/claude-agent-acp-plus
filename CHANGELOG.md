@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.23.1](https://github.com/zeo-workspace/claude-agent-acp-plus/compare/v0.23.0...v0.23.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **deps:** @modelcontextprotocol/sdk 1.30.0 -&gt; 1.31.0, clearing GHSA-6qxp-vccf-f47h ([52989ac](https://github.com/zeo-workspace/claude-agent-acp-plus/commit/52989ace7c59ed7e808890ef7bcdf5c95e9fd2ee))
+
+
+### Miscellaneous Chores
+
+* point repository URLs at the zeo-workspace organization ([66f4055](https://github.com/zeo-workspace/claude-agent-acp-plus/commit/66f405570bd0bc578ddac4f8fbb24b80cfe87fef))
+
+
+### Continuous Integration
+
+* run the gitleaks CLI instead of gitleaks-action ([45a6310](https://github.com/zeo-workspace/claude-agent-acp-plus/commit/45a6310b39dca71ba981db8209213acedf91d744))
+
 ## [0.23.0](https://github.com/lucascouts/claude-agent-acp-plus/compare/v0.22.2...v0.23.0) (2026-09-30)
 
 
